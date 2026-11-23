@@ -1,0 +1,25 @@
+# Dependencies & build artifacts
+node_modules/
+src-tauri/target/
+dist/
+
+# Runtime credentials, account backups, and local settings (never commit)
+*.cred.bin
+accounts.json
+accounts.json.bak
+proxy-settings.json
+brain-dir.txt
+.env
+.env.*
+
+# Logs & temporary files
+*.tmp
+*.log
+*.bak
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgyDock</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand-group">
+        <span class="brand-title">AgyDock</span>
+        <span class="brand-sep">/</span>
+        <span class="brand-sub" id="brandSubStatic">用量看板</span>
+        <div class="segmented segmented-sm hidden" id="primaryTabControl" role="tablist" aria-label="功能切换">
+          <button type="button" class="seg-btn active" data-tab="usage" role="tab">用量看板</button>
+          <button type="button" class="seg-btn" data-tab="proxy" role="tab">隔离代理</button>
+          <button type="button" class="seg-btn" data-tab="accounts" id="accountsTabBtn" role="tab">账号管理</button>
+        </div>
+        <span class="source-meta" id="sourceMeta" title="">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="sourceText">加载中...</span>
+        </span>
+      </div>
+
+      <div class="controls-group" id="usageControls">
+        <div class="segmented" id="rangeControl" role="group" aria-label="时间范围">
+          <button type="button" class="seg-btn" data-range="day">单日</button>
+          <button type="button" class="seg-btn" data-range="24h">24h</button>
+          <button type="button" class="seg-btn active" data-range="7d">7d</button>
+          <button type="button" class="seg-btn" data-range="30d">30d</button>
+          <button type="button" class="seg-btn" data-range="all">全部</button>
+        </div>
+
+        <div class="day-stepper hidden" id="dayStepper" aria-label="选择单日">
+          <button type="button" class="step-btn" id="dayPrevBtn" title="前一天">‹</button>
+          <input type="date" id="dayPicker" class="date-input mono" />
+          <button type="button" class="step-btn" id="dayNextBtn" title="后一天">›</button>
+        </div>
+
+        <button type="button" class="btn hidden" id="dirBtn" title="选择自定义 Antigravity 日志目录（按住 Shift 点击恢复默认）">
+          目录
+        </button>
+
+        <button type="button" class="btn" id="exportBtn" title="导出当前筛选范围内的会话明细 CSV">
+          导出 CSV
+        </button>
+
+        <button type="button" class="btn" id="refreshBtn" title="立即重新扫描日志">
+          刷新
+        </button>
+      </div>
+
+      <div class="controls-group hidden" id="proxyControls">
+        <button type="button" class="btn btn-primary" id="proxyLaunchBtn">
+          启动 Antigravity
+        </button>
+        <button type="button" class="btn" id="proxyAuditBtn">
+          验收 20s
+        </button>
+        <button type="button" class="btn" id="proxySettingsBtn">
+          设置
+        </button>
+        <button type="button" class="btn" id="proxyRefreshBtn">
+          刷新
+        </button>
+      </div>
+
+      <div class="controls-group hidden" id="accountsControls">
+        <button type="button" class="btn btn-primary" id="accountAddBtn" title="备份当前账号、清除登录并启动 Antigravity 以登录新账号">
+          添加账号
+        </button>
+        <button type="button" class="btn" id="accountSaveBtn" title="立即将当前 Windows 凭据管理器中的登录状态备份到本地">
+          保存当前账号
+        </button>
+        <button type="button" class="btn btn-danger-subtle" id="accountLogoutBtn" title="备份当前账号后退出登录（本地备份仍会保留）">
+          退出登录
+        </button>
+        <button type="button" class="btn" id="accountRefreshBtn">
+          刷新
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container" id="usageView">
+    <div class="notice hidden" id="noticeBar"></div>
+
+    <!-- Row 1: Unified KPI Strip -->
+    <section class="kpi-strip" aria-label="核心指标">
+      <div class="kpi-cell">
+        <div class="kpi-label">总 Token 消耗</div>
+        <div class="kpi-value mono" id="kpiTotal">—</div>
+        <div class="kpi-sub mono" id="kpiTotalSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">输入 / 输出 (Input / Output)</div>
+        <div class="kpi-value mono" id="kpiIo">—</div>
+        <div class="kpi-sub mono" id="kpiIoSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">缓存命中率 (Cache Hit)</div>
+        <div class="kpi-value mono" id="kpiCache">—</div>
+        <div class="kpi-sub mono" id="kpiCacheSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">活跃会话 (Sessions)</div>
+        <div class="kpi-value mono" id="kpiSessions">—</div>
+        <div class="kpi-sub mono" id="kpiSessionsSub">—</div>
+      </div>
+    </section>
+
+    <!-- Row 1.5: GitHub-Style Usage Heatmap Calendar -->
+    <section class="panel" aria-label="用量热力日历">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">用量日历</h2>
+          <span class="panel-note mono" id="heatmapSummary">近 1 年活跃 0 天</span>
+          <span class="panel-note">点击任意格子直达当日 24 小时明细</span>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="link-btn hidden" id="heatmapClearDayBtn">清除选中</button>
+        </div>
+      </div>
+      <div class="heatmap-stage" id="heatmapStage"></div>
+    </section>
+
+    <!-- Row 2: Main Token Trend Chart -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title" id="trendTitle">Token 消耗趋势</h2>
+          <span class="panel-note" id="trendHint">点击柱条查看当日按小时明细</span>
+          <button type="button" class="link-btn hidden" id="exitDayBtn">← 返回 7d</button>
+          <div class="legend-group" id="seriesLegend">
+            <button type="button" class="legend-item active" data-series="outputTokens">
+              <span class="swatch swatch-output"></span>
+              <span>Output</span>
+            </button>
+            <button type="button" class="legend-item active" data-series="inputTokens">
+              <span class="swatch swatch-input"></span>
+              <span>Input</span>
+            </button>
+            <button type="button" class="legend-item active" data-series="cacheReadTokens">
+              <span class="swatch swatch-cache"></span>
+              <span>Cache Read</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="panel-actions">
+          <label class="select-wrap" for="modelFilter">
+            <span class="sr-only">模型筛选</span>
+            <select id="modelFilter" class="select-input mono">
+              <option value="all">全部模型</option>
+            </select>
+          </label>
+
+          <div class="segmented segmented-sm" id="granularityControl" role="group" aria-label="聚合粒度">
+            <button type="button" class="seg-btn" data-granularity="hour">按小时</button>
+            <button type="button" class="seg-btn active" data-granularity="day">按日</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="chart-stage" id="trendChartStage">
+        <div class="chart-empty hidden" id="trendEmpty">当前筛选条件下暂无记录</div>
+      </div>
+    </section>
+
+    <!-- Row 3: Cache Hit Rate + Model Breakdown -->
+    <section class="grid-two">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title-group">
+            <h2 class="panel-title">缓存命中率趋势</h2>
+            <span class="panel-note mono" id="cacheAvgNote">均值 —</span>
+          </div>
+        </div>
+        <div class="chart-stage chart-stage-sm" id="cacheChartStage">
+          <div class="chart-empty hidden" id="cacheEmpty">暂无命中率数据</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title-group">
+            <h2 class="panel-title">模型分布</h2>
+            <span class="panel-note" id="modelFilterHint">点击行可筛选</span>
+          </div>
+          <button type="button" class="link-btn hidden" id="clearModelBtn">清除筛选</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="modelTable">
+            <thead>
+              <tr>
+                <th>模型</th>
+                <th class="num">调用</th>
+                <th class="num">净消耗</th>
+                <th class="num">命中率</th>
+                <th class="num">总计</th>
+              </tr>
+            </thead>
+            <tbody id="modelTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Row 4: Session Ledger -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">会话明细</h2>
+          <span class="panel-note mono" id="sessionCountNote">0 条</span>
+        </div>
+        <div class="panel-actions">
+          <div class="segmented segmented-sm" id="subagentModeControl" role="group" aria-label="子代理显示模式">
+            <button type="button" class="seg-btn active" data-mode="fold">合并子代理</button>
+            <button type="button" class="seg-btn" data-mode="flat">独立显示</button>
+          </div>
+          <input
+            type="search"
+            id="sessionSearch"
+            class="text-input"
+            placeholder="筛选摘要 / ID / 模型..."
+            autocomplete="off"
+          />
+          <select id="sessionSort" class="select-input">
+            <option value="recent">按最近活跃</option>
+            <option value="total">按总 Token</option>
+            <option value="output">按 Output</option>
+            <option value="calls">按调用次数</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table ledger-table" id="sessionTable">
+          <thead>
+            <tr>
+              <th style="width: 108px;">最近时间</th>
+              <th>会话摘要</th>
+              <th style="width: 164px;">主模型</th>
+              <th class="num" style="width: 56px;">调用</th>
+              <th class="num" style="width: 74px;">Input</th>
+              <th class="num" style="width: 72px;">Output</th>
+              <th class="num" style="width: 78px;">Cache</th>
+              <th class="num" style="width: 64px;">命中率</th>
+              <th class="num" style="width: 78px;">总计</th>
+            </tr>
+          </thead>
+          <tbody id="sessionTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="footer mono">
+      <span id="footerScanInfo">数据源: —</span>
+      <span id="footerUpdated">更新于 —</span>
+    </footer>
+  </main>
+
+  <!-- Isolated Proxy Tab View (Desktop) -->
+  <main class="container hidden" id="proxyView">
+    <div class="notice hidden" id="proxyWarnBanner">
+      <span>检测到 Windows 系统代理或 TUN 网卡处于开启状态。若要仅隔离 Antigravity 流量，请在 Clash Verge 中关闭「系统代理」和「Tun 模式」（保持端口监听即可）。</span>
+    </div>
+
+    <div class="notice notice-confirm hidden" id="proxyConfirmBanner">
+      <span id="proxyConfirmText"></span>
+      <div class="confirm-actions">
+        <button type="button" class="btn" id="proxyConfirmCancelBtn">取消</button>
+        <button type="button" class="btn btn-primary" id="proxyConfirmOkBtn">确认执行</button>
+      </div>
+    </div>
+
+    <div class="audit-bar hidden" id="proxyAuditBar">
+      <div class="audit-head mono">
+        <span id="proxyAuditLabel">验收中 0/20s</span>
+        <span>请在 Antigravity 中发一条消息触发模型请求</span>
+      </div>
+      <div class="audit-track"><div class="audit-fill" id="proxyAuditFill"></div></div>
+    </div>
+
+    <!-- Proxy KPI Strip -->
+    <section class="kpi-strip" aria-label="代理状态概览">
+      <div class="kpi-cell">
+        <div class="kpi-label">隔离代理状态</div>
+        <div class="kpi-value kpi-value-sm">
+          <span class="status-dot" id="proxyStatusDot"></span>
+          <span id="proxyHeadline">检测中...</span>
+        </div>
+        <div class="kpi-sub mono" id="proxyHeadlineSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">系统代理 / TUN</div>
+        <div class="kpi-value kpi-value-sm mono" id="proxyEnvValue">—</div>
+        <div class="kpi-sub mono" id="proxyEnvSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">进程状态</div>
+        <div class="kpi-value kpi-value-sm mono" id="proxyProcValue">—</div>
+        <div class="kpi-sub mono" id="proxyProcSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">实时连接 (代理 / TUN / 直连)</div>
+        <div class="kpi-value mono" id="proxyConnValue">—</div>
+        <div class="kpi-sub mono" id="proxyConnSub">走代理 / TUN / 公网直连</div>
+      </div>
+    </section>
+
+    <!-- Collapsible Settings Panel -->
+    <section class="panel hidden" id="proxySettingsPanel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">隔离代理配置</h2>
+          <span class="panel-note">修改后自动保存 · 不改动系统代理与 Clash 配置</span>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <div class="field-row">
+          <label class="field-label" for="proxyInputHost">代理地址</label>
+          <div class="field-inline">
+            <input type="text" id="proxyInputHost" class="text-input mono" style="width: 140px;" />
+            <label class="check-label">
+              <input type="checkbox" id="proxyChkAutoPort" checked />
+              <span>自动探测端口</span>
+            </label>
+            <input type="number" id="proxyInputPort" class="text-input mono" style="width: 86px;" min="1" max="65535" />
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label">启动选项</label>
+          <div class="field-inline">
+            <label class="check-label">
+              <input type="checkbox" id="proxyChkAutoClash" checked />
+              <span>端口未监听时自动启动 Clash Verge</span>
+            </label>
+            <label class="check-label">
+              <input type="checkbox" id="proxyChkDisableQuic" checked />
+              <span>禁用 QUIC (--disable-quic)</span>
+            </label>
+            <label class="check-label">
+              <input type="checkbox" id="proxyChkAutoRefresh" checked />
+              <span>自动刷新 (1.5s)</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label" for="proxyInputAgyPath">Antigravity 路径</label>
+          <div class="field-path">
+            <input type="text" id="proxyInputAgyPath" class="text-input mono flex-1" />
+            <button type="button" class="btn" id="proxyBtnBrowseAgy">浏览</button>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label" for="proxyInputClashPath">Clash Verge 路径</label>
+          <div class="field-path">
+            <input type="text" id="proxyInputClashPath" class="text-input mono flex-1" />
+            <button type="button" class="btn" id="proxyBtnBrowseClash">浏览</button>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label" for="proxyInputWorkspace">启动目录 (可选)</label>
+          <div class="field-path">
+            <input type="text" id="proxyInputWorkspace" class="text-input mono flex-1" placeholder="留空则按默认方式启动 Antigravity" />
+            <button type="button" class="btn" id="proxyBtnBrowseWorkspace">浏览</button>
+            <button type="button" class="btn" id="proxyBtnClearWorkspace">清空</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Dual-View Panel: Connections & Logs -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <div class="segmented segmented-sm" id="proxySubViewControl" role="group">
+            <button type="button" class="seg-btn active" data-subview="connections" id="proxyTabConnBtn">连接明细 (0)</button>
+            <button type="button" class="seg-btn" data-subview="logs">运行日志</button>
+          </div>
+          <label class="check-label" id="proxyConnTools">
+            <input type="checkbox" id="proxyChkShowIpc" />
+            <span>显示本地 IPC</span>
+          </label>
+        </div>
+
+        <div class="panel-actions">
+          <button type="button" class="btn" id="proxyBtnStartClash">Clash Verge</button>
+          <button type="button" class="btn" id="proxyBtnFlushDns">刷新 DNS</button>
+          <button type="button" class="btn" id="proxyBtnDryRun">参数预览</button>
+          <button type="button" class="btn btn-danger-subtle" id="proxyBtnStopAgy">结束进程</button>
+          <span class="panel-actions hidden" id="proxyLogTools">
+            <button type="button" class="btn" id="proxyBtnOpenReport">打开报告</button>
+            <button type="button" class="btn" id="proxyBtnCopyLog">复制</button>
+            <button type="button" class="btn" id="proxyBtnClearLog">清空</button>
+          </span>
+        </div>
+      </div>
+
+      <div class="table-wrap" id="proxyConnView">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 112px;">分类</th>
+              <th style="width: 170px;">进程</th>
+              <th class="num" style="width: 72px;">PID</th>
+              <th>本地端点</th>
+              <th>远端端点</th>
+              <th style="width: 170px;">状态 · 捕获时间</th>
+            </tr>
+          </thead>
+          <tbody id="proxyConnTableBody">
+            <tr class="empty-row"><td colspan="6">正在扫描本地连接...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="log-panel hidden" id="proxyLogView">
+        <pre class="log-pre mono" id="proxyLogPre"></pre>
+      </div>
+    </section>
+
+    <footer class="footer mono">
+      <span id="proxyFooterLeft">端口来源: —</span>
+      <span id="proxyFooterRight">更新于 —</span>
+    </footer>
+  </main>
+
+  <!-- Account Switching Tab View (Desktop) -->
+  <main class="container hidden" id="accountsView">
+    <div class="notice hidden" id="accountNotice">
+      <span id="accountNoticeText"></span>
+      <button type="button" class="notice-close" id="accountNoticeCloseBtn" title="关闭提示" aria-label="关闭提示">×</button>
+    </div>
+
+    <div class="notice notice-confirm hidden" id="accountConfirmBanner">
+      <span id="accountConfirmText"></span>
+      <div class="confirm-actions">
+        <button type="button" class="btn" id="accountConfirmCancelBtn">取消</button>
+        <button type="button" class="btn btn-primary" id="accountConfirmOkBtn">确认</button>
+      </div>
+    </div>
+
+    <div class="audit-bar hidden" id="accountWaitBar">
+      <div class="audit-head mono">
+        <span id="accountWaitLabel">等待登录 0/300s</span>
+        <span>请在 Antigravity 中登录新账号，成功后会自动保存</span>
+        <div class="acc-wait-actions">
+          <button type="button" class="btn hidden" id="accountWaitStopOnlyBtn">仅停止等待</button>
+          <button type="button" class="btn" id="accountWaitCancelBtn">取消并恢复原账号</button>
+        </div>
+      </div>
+      <div class="audit-track"><div class="audit-fill" id="accountWaitFill"></div></div>
+    </div>
+
+    <section class="kpi-strip" aria-label="账号概览">
+      <div class="kpi-cell">
+        <div class="kpi-label">当前登录账号</div>
+        <div class="kpi-value kpi-value-sm">
+          <span class="status-dot muted" id="accCurrentDot"></span>
+          <span class="mono acc-email-value acc-copyable" id="accCurrentEmail" title="点击复制邮箱">—</span>
+        </div>
+        <div class="kpi-sub mono" id="accCurrentSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">已保存账号</div>
+        <div class="kpi-value mono" id="accCount">—</div>
+        <div class="kpi-sub mono" id="accCountSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">运行与代理环境</div>
+        <div class="kpi-value kpi-value-sm">
+          <span class="status-dot muted" id="accEnvDot"></span>
+          <span class="mono acc-email-value" id="accEnvValue">检测中...</span>
+        </div>
+        <div class="kpi-sub mono" id="accEnvSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">最近切换</div>
+        <div class="kpi-value kpi-value-sm mono" id="accLastUsed">—</div>
+        <div class="kpi-sub mono" id="accLastUsedSub">—</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">账号列表</h2>
+          <span class="panel-note" id="accListNote">登录过一次的账号会保存在本地，之后可直接切换</span>
+          <button type="button" class="link-btn hidden" id="accountDetectSaveBtn">重新归档当前账号</button>
+        </div>
+        <div class="panel-actions acc-toolbar-actions">
+          <label class="check-label" title="勾选后切换账号会自动关闭并重启 Antigravity；取消则仅写入凭据">
+            <input type="checkbox" id="accountRestartChk" checked />
+            <span>切换后重启</span>
+          </label>
+          <input
+            type="search"
+            id="accountSearch"
+            class="text-input acc-search-input"
+            placeholder="筛选邮箱 / 备注..."
+            autocomplete="off"
+          />
+          <select id="accountSort" class="select-input">
+            <option value="default">默认排序</option>
+            <option value="recent">按最近使用</option>
+            <option value="switches">按切换次数</option>
+            <option value="saved">按保存时间</option>
+            <option value="email">按邮箱 A-Z</option>
+          </select>
+          <button type="button" class="btn" id="accountVerifyBtn" title="使用 DPAPI 解密检验全部本地凭据备份是否完好">校验备份</button>
+          <button type="button" class="btn" id="accountOpenDirBtn" title="在资源管理器中打开加密备份目录">打开目录</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="accountsTable">
+          <thead>
+            <tr>
+              <th>账号</th>
+              <th style="width: 152px;">备注</th>
+              <th style="width: 138px;">使用记录</th>
+              <th style="width: 156px;">凭据状态</th>
+              <th style="width: 248px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="accountsTableBody">
+            <tr class="empty-row"><td colspan="5">正在读取账号...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group acc-log-title-group">
+          <h2 class="panel-title">操作日志</h2>
+          <span class="tag mono" id="accountLogCount">0</span>
+          <span class="panel-note mono acc-log-preview" id="accountLogPreview">就绪</span>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn" id="accountLogToggleBtn">展开日志</button>
+          <button type="button" class="btn" id="accountLogCopyBtn">复制</button>
+          <button type="button" class="btn" id="accountLogClearBtn">清空</button>
+        </div>
+      </div>
+      <div class="log-panel hidden" id="accountLogBody">
+        <pre class="log-pre mono acc-log-pre" id="accountLogPre"></pre>
+      </div>
+    </section>
+
+    <footer class="footer mono">
+      <span id="accountFooterLeft">凭据来源: Windows 凭据管理器 (gemini:antigravity) · 托盘右键支持快速切换</span>
+      <span id="accountFooterRight">更新于 —</span>
+    </footer>
+  </main>
+
+  <div class="tooltip hidden" id="chartTooltip" role="tooltip"></div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
