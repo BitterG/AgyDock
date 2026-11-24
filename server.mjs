@@ -27,6 +27,7 @@ function parseCliArgs(argv) {
     port: Number(process.env.PORT) || 3789,
     host: process.env.HOST || '127.0.0.1',
     dir: getDefaultBrainDir(),
+    hasExplicitDir: Boolean(process.env.ANTIGRAVITY_BRAIN_DIR?.trim()),
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -36,6 +37,7 @@ function parseCliArgs(argv) {
       i += 1;
     } else if ((token === '--dir' || token === '-d') && argv[i + 1]) {
       args.dir = path.resolve(argv[i + 1]);
+      args.hasExplicitDir = true;
       i += 1;
     } else if (token === '--host' && argv[i + 1]) {
       args.host = argv[i + 1];
@@ -84,8 +86,13 @@ async function serveStatic(res, pathname) {
   }
 }
 
-export function createRequestHandler({ brainDir }) {
-  const scanner = new BrainScanner(brainDir);
+export function createRequestHandler({ brainDir, sources, autoDiscover } = {}) {
+  const scannerInput = Array.isArray(sources)
+    ? sources
+    : autoDiscover
+      ? { autoDiscover: true }
+      : brainDir || { autoDiscover: true };
+  const scanner = new BrainScanner(scannerInput);
 
   return async function handleRequest(req, res) {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
@@ -103,6 +110,7 @@ export function createRequestHandler({ brainDir }) {
           range: url.searchParams.get('range') || '7d',
           granularity: url.searchParams.get('granularity') || undefined,
           model: url.searchParams.get('model') || 'all',
+          source: url.searchParams.get('source') || 'all',
           day: url.searchParams.get('day') || undefined,
         });
         sendJson(res, 200, data);
@@ -111,14 +119,21 @@ export function createRequestHandler({ brainDir }) {
 
       if (pathname.startsWith('/api/sessions/')) {
         const sessionId = decodeURIComponent(pathname.slice('/api/sessions/'.length));
+        const sourceFilter = url.searchParams.get('source');
         const scanResult = await scanner.scan();
-        const session = scanResult.sessions.find((s) => s.id === sessionId);
+        const session = scanResult.sessions.find(
+          (s) =>
+            s.id === sessionId &&
+            (!sourceFilter || sourceFilter === 'all' || (s.source || 'app') === sourceFilter)
+        );
         if (!session) {
           sendJson(res, 404, { error: 'Session not found' });
           return;
         }
         sendJson(res, 200, {
           id: session.id,
+          source: session.source || 'app',
+          sourceLabel: session.sourceLabel || 'Antigravity App',
           title: session.title,
           startedAt: session.startedAt,
           lastAt: session.lastAt,
@@ -133,6 +148,7 @@ export function createRequestHandler({ brainDir }) {
           range: url.searchParams.get('range') || '7d',
           granularity: url.searchParams.get('granularity') || undefined,
           model: url.searchParams.get('model') || 'all',
+          source: url.searchParams.get('source') || 'all',
           day: url.searchParams.get('day') || undefined,
         });
         const csv = buildSessionsCsv(data.sessions);
@@ -154,16 +170,20 @@ export function createRequestHandler({ brainDir }) {
   };
 }
 
-export function createAppServer({ brainDir }) {
-  return http.createServer(createRequestHandler({ brainDir }));
+export function createAppServer(options) {
+  return http.createServer(createRequestHandler(options));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
-  const { port, host, dir } = parseCliArgs(process.argv.slice(2));
-  const server = createAppServer({ brainDir: dir });
+  const { port, host, dir, hasExplicitDir } = parseCliArgs(process.argv.slice(2));
+  const server = createAppServer(hasExplicitDir ? { brainDir: dir } : { autoDiscover: true });
 
   server.listen(port, host, () => {
     console.log(`Antigravity Usage Dashboard listening at http://${host}:${port}`);
-    console.log(`Scanning brain directory: ${dir}`);
+    console.log(
+      hasExplicitDir
+        ? `Scanning brain directory: ${dir}`
+        : 'Scanning multi-source brain directories (Antigravity App + agy CLI + T3 Code ACP)'
+    );
   });
 }

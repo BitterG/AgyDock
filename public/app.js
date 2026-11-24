@@ -15,22 +15,36 @@ const tauriInvoke =
     : null;
 const isDesktopApp = Boolean(tauriInvoke);
 
-async function apiGetUsage({ range, granularity, model, day }) {
+async function apiGetUsage({ range, granularity, model, source, day }) {
   if (tauriInvoke) {
-    return tauriInvoke('get_usage', { range, granularity, model, day: day || null });
+    return tauriInvoke('get_usage', {
+      range,
+      granularity,
+      model,
+      source: source || 'all',
+      day: day || null,
+    });
   }
-  const params = new URLSearchParams({ range, granularity, model });
+  const params = new URLSearchParams({
+    range,
+    granularity,
+    model,
+    source: source || 'all',
+  });
   if (day) params.set('day', day);
   const res = await fetch(`/api/usage?${params.toString()}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-async function apiGetSessionDetail(sessionId) {
+async function apiGetSessionDetail(sessionId, source) {
   if (tauriInvoke) {
-    return tauriInvoke('get_session_detail', { sessionId });
+    return tauriInvoke('get_session_detail', { sessionId, source: source || null });
   }
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  const params = new URLSearchParams();
+  if (source) params.set('source', source);
+  const qs = params.toString();
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}${qs ? `?${qs}` : ''}`);
   if (!res.ok) throw new Error('读取失败');
   return res.json();
 }
@@ -42,6 +56,7 @@ const state = {
   granularity: 'day',
   granularityManual: false,
   model: 'all',
+  source: 'all',
   subagentMode: 'fold',
   search: '',
   sort: 'recent',
@@ -86,6 +101,10 @@ const els = {
   exportBtn: document.getElementById('exportBtn'),
   refreshBtn: document.getElementById('refreshBtn'),
   noticeBar: document.getElementById('noticeBar'),
+  sourceBar: document.getElementById('sourceBar'),
+  sourceFilterControl: document.getElementById('sourceFilterControl'),
+  sourceBarNote: document.getElementById('sourceBarNote'),
+  resetAutoSourceBtn: document.getElementById('resetAutoSourceBtn'),
 
   kpiTotal: document.getElementById('kpiTotal'),
   kpiTotalSub: document.getElementById('kpiTotalSub'),
@@ -267,6 +286,85 @@ function renderNotice(meta, summary) {
   }
 }
 
+function sessionKey(session) {
+  return `${session?.source || 'app'}:${session?.id || ''}`;
+}
+
+function getVisibleSources(meta) {
+  const all = Array.isArray(meta?.sources) ? meta.sources : [];
+  if (meta?.isCustomDir) return all;
+  return all.filter((s) => s.exists || (s.sessionCount || 0) > 0);
+}
+
+function getActiveSourceLabel(meta) {
+  if (state.source === 'all') return '全部来源';
+  const matched = getVisibleSources(meta).find((s) => s.id === state.source);
+  return matched?.label || state.source;
+}
+
+function formatSourceShortTag(source) {
+  if (source === 'cli') {
+    return '<span class="tag tag-src-cli" title="来自 agy CLI">CLI</span>';
+  }
+  if (source === 't3') {
+    return '<span class="tag tag-src-t3" title="来自 T3 Code ACP">T3</span>';
+  }
+  if (source === 'app') {
+    return '<span class="tag" title="来自 Antigravity App">App</span>';
+  }
+  return '<span class="tag" title="来自自定义目录">自定义</span>';
+}
+
+function renderSourceFilterBar(meta) {
+  if (!els.sourceBar || !els.sourceFilterControl) return;
+  const sources = getVisibleSources(meta);
+  const shouldShow =
+    Boolean(meta?.isCustomDir) ||
+    sources.length > 1 ||
+    (sources.length === 1 && sources[0]?.id !== 'app');
+
+  els.sourceBar.classList.toggle('hidden', !shouldShow);
+  if (!shouldShow) {
+    els.sourceFilterControl.innerHTML = '';
+    if (els.sourceBarNote) els.sourceBarNote.textContent = '';
+    if (els.resetAutoSourceBtn) els.resetAutoSourceBtn.classList.add('hidden');
+    return;
+  }
+
+  const totalFromSources = sources.reduce((acc, s) => acc + (s.sessionCount || 0), 0);
+  const buttons = [];
+  if (sources.length > 1) {
+    buttons.push(
+      `<button type="button" class="seg-btn${state.source === 'all' ? ' active' : ''}" data-source="all">全部 (${totalFromSources})</button>`
+    );
+  }
+  for (const s of sources) {
+    const active = state.source === s.id || (sources.length === 1 && state.source === 'all');
+    const title = (s.dirs || []).join('\n');
+    buttons.push(
+      `<button type="button" class="seg-btn${active ? ' active' : ''}" data-source="${escapeHtml(s.id)}" title="${escapeHtml(title)}">${escapeHtml(s.label)} (${s.sessionCount || 0})</button>`
+    );
+  }
+  els.sourceFilterControl.innerHTML = buttons.join('');
+
+  if (els.sourceBarNote) {
+    if (meta?.isCustomDir) {
+      els.sourceBarNote.textContent = `当前为自定义目录: ${meta.brainDir}`;
+    } else if (state.source !== 'all') {
+      const activeSource = sources.find((s) => s.id === state.source);
+      els.sourceBarNote.textContent = `已筛选: ${activeSource?.label || getActiveSourceLabel(meta)} · ${activeSource?.sessionCount ?? 0} 个会话`;
+    } else if (sources.length > 1) {
+      els.sourceBarNote.textContent = `已聚合 ${sources.length} 个来源 · ${totalFromSources} 个会话`;
+    } else {
+      els.sourceBarNote.textContent = `来源: ${sources[0].label} · ${totalFromSources} 个会话`;
+    }
+  }
+
+  if (els.resetAutoSourceBtn) {
+    els.resetAutoSourceBtn.classList.toggle('hidden', !(isDesktopApp && meta?.isCustomDir));
+  }
+}
+
 function renderHeaderAndKpis(data) {
   const { meta, summary } = data;
 
@@ -280,7 +378,15 @@ function renderHeaderAndKpis(data) {
   } else {
     els.sourceText.textContent = `${meta.parsedSessions} sessions`;
   }
-  els.sourceMeta.title = meta.brainDir;
+
+  const sources = getVisibleSources(meta);
+  if (sources.length > 0) {
+    els.sourceMeta.title = sources
+      .map((s) => `${s.label} (${s.sessionCount}): ${(s.dirs || []).join(', ')}`)
+      .join('\n');
+  } else {
+    els.sourceMeta.title = meta.brainDir;
+  }
 
   // KPI 1: Total Tokens
   els.kpiTotal.textContent = formatTokensM(summary.totalTokens);
@@ -317,7 +423,16 @@ function renderHeaderAndKpis(data) {
   els.cacheAvgNote.textContent =
     summary.callCount > 0 ? `均值 ${formatPct(summary.cacheHitRate)}` : '均值 —';
 
-  els.footerScanInfo.textContent = `数据源: ${meta.brainDir} (${meta.parsedSessions} 个会话)`;
+  if (state.source !== 'all') {
+    const matched = sources.find((s) => s.id === state.source);
+    if (matched) {
+      els.footerScanInfo.textContent = `数据源: ${matched.label} · ${(matched.dirs || []).join(' ; ') || meta.brainDir} (${matched.sessionCount} 个会话)`;
+    } else {
+      els.footerScanInfo.textContent = `数据源: ${meta.brainDir} (${meta.parsedSessions} 个会话)`;
+    }
+  } else {
+    els.footerScanInfo.textContent = `数据源: ${meta.brainDir} (${meta.parsedSessions} 个会话)`;
+  }
   els.footerUpdated.textContent = `更新于 ${formatTimeOnly(meta.scannedAt)}`;
 }
 
@@ -386,7 +501,7 @@ function buildDisplaySessions(sessions) {
 
   for (const s of sessions) {
     if (!s.isSubagent) {
-      groupMap.set(s.id, {
+      groupMap.set(sessionKey(s), {
         ...s,
         ownCallCount: s.callCount,
         ownTotalTokens: s.totalTokens,
@@ -397,7 +512,9 @@ function buildDisplaySessions(sessions) {
 
   for (const s of sessions) {
     if (!s.isSubagent) continue;
-    const parentGroup = s.rootParentId ? groupMap.get(s.rootParentId) : null;
+    const parentGroup = s.rootParentId
+      ? groupMap.get(sessionKey({ source: s.source, id: s.rootParentId }))
+      : null;
     if (!parentGroup) {
       orphans.push({ ...s, childSubagents: [] });
       continue;
@@ -440,6 +557,7 @@ function getFilteredSortedSessions(sessions) {
         s.title.toLowerCase().includes(q) ||
         s.id.toLowerCase().includes(q) ||
         s.primaryModel.toLowerCase().includes(q) ||
+        (s.sourceLabel && s.sourceLabel.toLowerCase().includes(q)) ||
         (s.parentTitle && s.parentTitle.toLowerCase().includes(q))
       ) {
         return true;
@@ -448,7 +566,8 @@ function getFilteredSortedSessions(sessions) {
         (c) =>
           c.title.toLowerCase().includes(q) ||
           c.id.toLowerCase().includes(q) ||
-          c.primaryModel.toLowerCase().includes(q)
+          c.primaryModel.toLowerCase().includes(q) ||
+          (c.sourceLabel && c.sourceLabel.toLowerCase().includes(q))
       );
     });
   }
@@ -466,11 +585,12 @@ function getFilteredSortedSessions(sessions) {
   return sorted;
 }
 
-async function fetchSessionDetail(sessionId) {
-  let detail = state.sessionDetailCache.get(sessionId);
+async function fetchSessionDetail(sessionId, source = null) {
+  const key = `${source || 'app'}:${sessionId}`;
+  let detail = state.sessionDetailCache.get(key);
   if (!detail) {
-    detail = await apiGetSessionDetail(sessionId);
-    state.sessionDetailCache.set(sessionId, detail);
+    detail = await apiGetSessionDetail(sessionId, source);
+    state.sessionDetailCache.set(key, detail);
   }
   return detail;
 }
@@ -520,7 +640,7 @@ async function renderSessionDetailInto(tr, session) {
 
   let detail;
   try {
-    detail = await fetchSessionDetail(session.id);
+    detail = await fetchSessionDetail(session.id, session.source || null);
   } catch {
     td.innerHTML = '<div class="detail-box"><span class="panel-note">无法读取会话详情</span></div>';
     return;
@@ -533,7 +653,7 @@ async function renderSessionDetailInto(tr, session) {
       .map((c) => {
         const typeTag = c.subagentType ? `<span class="tag">${escapeHtml(c.subagentType)}</span>` : '';
         return `
-          <tr class="subagent-row" data-child-id="${escapeHtml(c.id)}">
+          <tr class="subagent-row" data-child-id="${escapeHtml(c.id)}" data-child-source="${escapeHtml(c.source || session.source || 'app')}">
             <td class="mono" style="white-space:nowrap;">${formatDateTime(c.lastAt)}</td>
             <td>
               <div class="session-title-row">
@@ -582,11 +702,12 @@ async function renderSessionDetailInto(tr, session) {
     session.isSubagent && session.parentTitle
       ? ` · 归属主会话: ${session.parentTitle}`
       : '';
+  const sourceLabel = detail.sourceLabel || session.sourceLabel || 'Antigravity App';
 
   td.innerHTML = `
     <div class="detail-box">
       <div class="detail-meta mono">
-        <span>ID: ${escapeHtml(session.id)} · 持续 ${formatDuration(session.durationMs)} · 工具调用 ${session.toolCallCount} 次${escapeHtml(parentNote)}</span>
+        <span>ID: ${escapeHtml(session.id)} · 来源: ${escapeHtml(sourceLabel)} · 持续 ${formatDuration(session.durationMs)} · 工具调用 ${session.toolCallCount} 次${escapeHtml(parentNote)}</span>
         <span>主会话 ${detail.events.length} 次响应${children.length ? ` · 含 ${children.length} 个子代理` : ''}</span>
       </div>
       ${subagentsBlockHtml}
@@ -599,6 +720,7 @@ async function renderSessionDetailInto(tr, session) {
     childTr.addEventListener('click', async (evt) => {
       evt.stopPropagation();
       const cid = childTr.dataset.childId;
+      const csource = childTr.dataset.childSource || session.source || null;
       const stepsRow = td.querySelector(`tr[data-child-steps-row="${CSS.escape(cid)}"]`);
       if (!stepsRow) return;
       const isHidden = stepsRow.classList.contains('hidden');
@@ -610,7 +732,7 @@ async function renderSessionDetailInto(tr, session) {
       const cell = stepsRow.querySelector('td');
       cell.innerHTML = '<span class="panel-note">正在读取子代理步骤...</span>';
       try {
-        const cDetail = await fetchSessionDetail(cid);
+        const cDetail = await fetchSessionDetail(cid, csource);
         cell.innerHTML = buildStepTableHtml(cDetail.events);
       } catch {
         cell.innerHTML = '<span class="panel-note">无法读取子代理步骤</span>';
@@ -635,13 +757,19 @@ function renderSessionsTable(sessions) {
     return;
   }
 
+  const showSourceTag = getVisibleSources(state.data?.meta).length > 1;
   const frag = document.createDocumentFragment();
   for (const s of list) {
-    const isExpanded = state.expandedSessionId === s.id;
+    const rowKey = sessionKey(s);
+    const isExpanded = state.expandedSessionId === rowKey;
     const tr = document.createElement('tr');
     tr.className = `clickable${isExpanded ? ' selected' : ''}`;
 
     const subCount = s.childSubagents?.length || 0;
+    const sourceTagHtml =
+      showSourceTag || (s.source && s.source !== 'app')
+        ? formatSourceShortTag(s.source || 'app')
+        : '';
     const titleTagHtml = s.isSubagent
       ? `<span class="tag">子代理${s.subagentType ? ` · ${escapeHtml(s.subagentType)}` : ''}</span>`
       : '';
@@ -655,7 +783,7 @@ function renderSessionsTable(sessions) {
       <td class="mono" style="white-space:nowrap;">${formatDateTime(s.lastAt)}</td>
       <td class="session-title-cell">
         <div class="session-title-row">
-          ${titleTagHtml}
+          ${sourceTagHtml}${titleTagHtml}
           <div class="session-title" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</div>
         </div>
         <div class="session-meta-line">
@@ -674,7 +802,7 @@ function renderSessionsTable(sessions) {
     `;
 
     tr.addEventListener('click', () => {
-      state.expandedSessionId = state.expandedSessionId === s.id ? null : s.id;
+      state.expandedSessionId = state.expandedSessionId === rowKey ? null : rowKey;
       renderSessionsTable(state.data.sessions);
     });
     frag.appendChild(tr);
@@ -703,10 +831,12 @@ function renderCharts() {
   for (const d of cal) {
     if (!peakDay || d.totalTokens > peakDay.totalTokens) peakDay = d;
   }
+  const sourceNote =
+    state.source !== 'all' ? ` · 来源 ${getActiveSourceLabel(state.data.meta)}` : '';
   const modelNote = state.model !== 'all' ? ` · 模型 ${state.model}` : '';
   els.heatmapSummary.textContent = peakDay
-    ? `活跃 ${cal.length} 天 · 累计 ${formatTokensM(calTotal)} · 峰值 ${peakDay.day} (${formatTokensM(peakDay.totalTokens)})${modelNote}`
-    : `活跃 0 天${modelNote}`;
+    ? `活跃 ${cal.length} 天 · 累计 ${formatTokensM(calTotal)} · 峰值 ${peakDay.day} (${formatTokensM(peakDay.totalTokens)})${sourceNote}${modelNote}`
+    : `活跃 0 天${sourceNote}${modelNote}`;
 
   renderUsageHeatmap({
     container: els.heatmapStage,
@@ -749,6 +879,7 @@ function renderAll() {
   if (!state.data) return;
   syncSegmentedButtons();
   renderNotice(state.data.meta, state.data.summary);
+  renderSourceFilterBar(state.data.meta);
   renderHeaderAndKpis(state.data);
   syncModelFilterOptions(state.data.meta.availableModels);
   renderModelsTable(state.data.models);
@@ -766,8 +897,24 @@ async function fetchUsage() {
       range: state.range,
       granularity: state.granularity,
       model: state.model,
+      source: state.source,
       day: state.selectedDay,
     });
+    const availSources = getVisibleSources(state.data?.meta);
+    if (
+      state.source !== 'all' &&
+      availSources.length > 0 &&
+      !availSources.some((s) => s.id === state.source)
+    ) {
+      state.source = 'all';
+      state.data = await apiGetUsage({
+        range: state.range,
+        granularity: state.granularity,
+        model: state.model,
+        source: state.source,
+        day: state.selectedDay,
+      });
+    }
     state.sessionDetailCache.clear();
     renderAll();
   } catch (err) {
@@ -788,6 +935,7 @@ async function handlePickDir(evt) {
       ? await tauriInvoke('reset_brain_dir')
       : await tauriInvoke('pick_brain_dir');
     if (res?.changed) {
+      state.source = 'all';
       state.expandedSessionId = null;
       await fetchUsage();
     }
@@ -899,6 +1047,29 @@ els.sessionSort.addEventListener('change', () => {
 
 els.refreshBtn.addEventListener('click', () => fetchUsage());
 
+els.sourceFilterControl?.addEventListener('click', (evt) => {
+  const btn = evt.target.closest('.seg-btn');
+  if (!btn || btn.classList.contains('active')) return;
+  state.source = btn.dataset.source || 'all';
+  state.expandedSessionId = null;
+  fetchUsage();
+});
+
+els.resetAutoSourceBtn?.addEventListener('click', async () => {
+  if (!tauriInvoke) return;
+  try {
+    const res = await tauriInvoke('reset_brain_dir');
+    if (res?.changed) {
+      state.source = 'all';
+      state.expandedSessionId = null;
+      await fetchUsage();
+    }
+  } catch (err) {
+    els.noticeBar.className = 'notice notice-error';
+    els.noticeBar.textContent = `恢复默认扫描失败: ${err?.message || err}`;
+  }
+});
+
 if (isDesktopApp && els.dirBtn) {
   els.dirBtn.classList.remove('hidden');
   els.dirBtn.addEventListener('click', handlePickDir);
@@ -912,6 +1083,7 @@ els.exportBtn.addEventListener('click', async () => {
         range: state.range,
         granularity: state.granularity,
         model: state.model,
+        source: state.source,
         day: state.selectedDay || null,
       });
       if (res?.saved) {
@@ -931,6 +1103,7 @@ els.exportBtn.addEventListener('click', async () => {
     range: state.range,
     granularity: state.granularity,
     model: state.model,
+    source: state.source,
   });
   if (state.selectedDay) params.set('day', state.selectedDay);
   window.location.href = `/api/export.csv?${params.toString()}`;

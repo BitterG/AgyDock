@@ -10,7 +10,7 @@
 
 - 成品路径：`dist/AgyDock.exe`
 - **分发给朋友**：直接把 `AgyDock.exe` 发给朋友，双击即可运行。
-- **自动识别**：启动后自动扫描当前电脑用户的 `%USERPROFILE%\.gemini\antigravity\brain` 目录。
+- **多来源自动聚合**：启动后自动发现并聚合扫描 Antigravity App（`%USERPROFILE%\.gemini\antigravity\brain`）、`agy CLI`（`%USERPROFILE%\.gemini\antigravity-cli\brain`）与 T3 Code ACP（`%USERPROFILE%\.t3\userdata\providers\antigravity\*\antigravity-acp\brain`）会话目录。
 - **桌面端专属功能**：
   - **系统托盘驻留**：点击关闭按钮（`×`）自动隐藏到右下角状态栏托盘不退出（隐藏后自动暂停轮询，几乎零占用）；左键点击托盘图标立即呼出主窗口，右键菜单提供「显示主窗口 / 隐藏到托盘 / 退出程序」；
   - 顶栏一键切换 **用量看板 / 隔离代理** 双模块，完全免去 `.NET 8 Desktop Runtime` 依赖；
@@ -20,7 +20,7 @@
     - 自动读取 Clash Verge 配置与端口探测、启动时自动拉起 Clash Verge、只读检测 Windows 系统代理与 TUN 虚拟网卡；
     - 基于 Win32 `GetExtendedTcpTable` 实时扫描 TCP 连接明细（区分 `走代理`、`TUN Fake-IP`、`公网直连`、`本地 IPC`）；
     - 支持「验收 20s」累计检查并生成验收报告、刷新 DNS、启动参数预览、结束进程与可折叠路径配置；
-  - **用量看板桌面增强**：顶栏 **目录** 按钮支持原生文件夹选择并记住配置（按住 `Shift` 恢复默认）；**导出 CSV** 弹出系统原生「另存为」框。
+  - **用量看板桌面增强**：顶栏 **目录** 按钮支持原生文件夹选择并记住配置（按住 `Shift` 或点击「恢复自动多来源聚合」恢复默认）；**导出 CSV** 弹出系统原生「另存为」框。
   - **账号管理（多账号，免重复登录）**：
     - 顶栏「账号管理」页集中展示当前登录账号（支持点击复制邮箱与令牌状态）、已保存账号健康度、Antigravity 运行与隔离代理环境、以及全局最近切换统计；
     - **添加账号 / 退出登录**：添加前自动备份当前账号 → 关闭 Antigravity → 清除系统登录凭据 → 重新启动等待新账号登录并自动归档；支持「取消并恢复原账号」与「仅停止等待」；退出登录前同样自动备份，绝不丢失已保存凭据；
@@ -60,6 +60,7 @@ node server.mjs --port 4000 --dir "C:\Users\<用户名>\.gemini\antigravity\brai
 
 ## 核心功能
 
+- **多来源聚合与筛选**：同步扫描 Antigravity App、agy CLI 与 T3 Code ACP 会话日志（自动清理 T3 Code 首轮提示词包装标签以还原真实标题），支持来源筛选条、会话来源标签及按来源导出 CSV。
 - **Token 总览（统一换算为 M）**：总消耗、Fresh Input / Output 拆分、缓存命中率（`cache_read / (input + cache_read)`）、主会话数与子代理数。
 - **Token 消耗趋势**：按日 / 按小时 SVG 堆叠柱状图，点击图例可独立开关 `Output`、`Input`、`Cache Read` 图层。
 - **缓存命中率趋势**：分时段命中率柱状图与均值虚线参考线。

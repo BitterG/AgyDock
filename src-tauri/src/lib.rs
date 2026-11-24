@@ -94,6 +94,7 @@ fn get_usage(
     range: Option<String>,
     granularity: Option<String>,
     model: Option<String>,
+    source: Option<String>,
     day: Option<String>,
 ) -> Result<UsageResponse, String> {
     let mut scanner = state.scanner.lock().map_err(|_| "Scanner lock poisoned")?;
@@ -103,6 +104,7 @@ fn get_usage(
         range.as_deref(),
         granularity.as_deref(),
         model.as_deref(),
+        source.as_deref(),
         day.as_deref(),
         None,
     ))
@@ -112,16 +114,23 @@ fn get_usage(
 fn get_session_detail(
     state: State<'_, AppState>,
     session_id: String,
+    source: Option<String>,
 ) -> Result<SessionDetailResponse, String> {
     let mut scanner = state.scanner.lock().map_err(|_| "Scanner lock poisoned")?;
     let scan_res = scanner.scan();
+    let src_filter = source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
     let session = scan_res
         .sessions
         .into_iter()
-        .find(|s| s.id == session_id)
+        .find(|s| s.id == session_id && src_filter.is_none_or(|sf| s.source == sf))
         .ok_or_else(|| "Session not found".to_string())?;
     Ok(SessionDetailResponse {
         id: session.id,
+        source: session.source,
+        source_label: session.source_label,
         title: session.title,
         started_at: session.started_at,
         last_at: session.last_at,
@@ -133,7 +142,7 @@ fn get_session_detail(
 fn pick_brain_dir(state: State<'_, AppState>) -> Result<DirPickResult, String> {
     let current_dir = {
         let scanner = state.scanner.lock().map_err(|_| "Scanner lock poisoned")?;
-        scanner.brain_dir.clone()
+        scanner.primary_dir()
     };
 
     let mut dialog = rfd::FileDialog::new().set_title("选择 Antigravity brain 日志目录");
@@ -162,7 +171,7 @@ fn reset_brain_dir(state: State<'_, AppState>) -> Result<DirPickResult, String> 
     let default_dir = get_default_brain_dir();
     save_persisted_brain_dir(None);
     let mut scanner = state.scanner.lock().map_err(|_| "Scanner lock poisoned")?;
-    scanner.set_dir(default_dir.clone());
+    scanner.reset_to_auto();
     Ok(DirPickResult {
         changed: true,
         brain_dir: default_dir.to_string_lossy().to_string(),
@@ -175,6 +184,7 @@ fn export_csv(
     range: Option<String>,
     granularity: Option<String>,
     model: Option<String>,
+    source: Option<String>,
     day: Option<String>,
 ) -> Result<ExportCsvResult, String> {
     let data = {
@@ -185,6 +195,7 @@ fn export_csv(
             range.as_deref(),
             granularity.as_deref(),
             model.as_deref(),
+            source.as_deref(),
             day.as_deref(),
             None,
         )
@@ -1349,12 +1360,22 @@ pub fn run() {
         return;
     };
 
-    let initial_dir: PathBuf = load_persisted_brain_dir().unwrap_or_else(get_default_brain_dir);
+    let initial_scanner = if let Some(custom_dir) = load_persisted_brain_dir() {
+        BrainScanner::new(custom_dir)
+    } else if let Some(env_dir) = std::env::var("ANTIGRAVITY_BRAIN_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        BrainScanner::new(PathBuf::from(env_dir))
+    } else {
+        BrainScanner::new_auto()
+    };
     let initial_proxy_settings = ProxySettings::load();
 
     tauri::Builder::default()
         .manage(AppState {
-            scanner: Mutex::new(BrainScanner::new(initial_dir)),
+            scanner: Mutex::new(initial_scanner),
             proxy_settings: Mutex::new(initial_proxy_settings),
             account_lock: Arc::new(Mutex::new(())),
             tray_signature: Mutex::new(String::new()),

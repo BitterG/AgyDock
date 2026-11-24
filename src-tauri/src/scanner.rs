@@ -59,6 +59,123 @@ fn re_manage_subagents() -> &'static Regex {
     })
 }
 
+fn re_wrapped_system_blocks() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?is)<t3_code_instructions>[\s\S]*?(?:</t3_code_instructions>|$)|<runtime_info>[\s\S]*?(?:</runtime_info>|$)",
+        )
+        .unwrap()
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct BrainSourceSpec {
+    pub id: String,
+    pub label: String,
+    pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSourceInfo {
+    pub id: String,
+    pub label: String,
+    pub dirs: Vec<String>,
+    pub exists: bool,
+    pub session_count: usize,
+}
+
+pub fn infer_source_from_dir(dir: &Path) -> (String, String) {
+    let norm = dir
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase();
+    if norm.contains("/antigravity-acp/") || norm.ends_with("/antigravity-acp/brain") {
+        ("t3".to_string(), "T3 Code".to_string())
+    } else if norm.contains("/antigravity-cli/") || norm.ends_with("/antigravity-cli/brain") {
+        ("cli".to_string(), "agy CLI".to_string())
+    } else if norm.contains("/.gemini/antigravity/") || norm.ends_with("/antigravity/brain") {
+        ("app".to_string(), "Antigravity App".to_string())
+    } else {
+        ("custom".to_string(), "自定义目录".to_string())
+    }
+}
+
+pub fn discover_brain_sources_from_home(home: Option<&Path>) -> Vec<BrainSourceSpec> {
+    let mut sources = Vec::new();
+    let Some(h) = home else {
+        sources.push(BrainSourceSpec {
+            id: "app".to_string(),
+            label: "Antigravity App".to_string(),
+            dir: PathBuf::from(".gemini").join("antigravity").join("brain"),
+        });
+        sources.push(BrainSourceSpec {
+            id: "cli".to_string(),
+            label: "agy CLI".to_string(),
+            dir: PathBuf::from(".gemini").join("antigravity-cli").join("brain"),
+        });
+        return sources;
+    };
+
+    sources.push(BrainSourceSpec {
+        id: "app".to_string(),
+        label: "Antigravity App".to_string(),
+        dir: h.join(".gemini").join("antigravity").join("brain"),
+    });
+    sources.push(BrainSourceSpec {
+        id: "cli".to_string(),
+        label: "agy CLI".to_string(),
+        dir: h.join(".gemini").join("antigravity-cli").join("brain"),
+    });
+
+    let t3_root = h
+        .join(".t3")
+        .join("userdata")
+        .join("providers")
+        .join("antigravity");
+    if let Ok(entries) = fs::read_dir(&t3_root) {
+        let mut subdirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        subdirs.sort();
+        for sub in subdirs {
+            let acp_brain = sub.join("antigravity-acp").join("brain");
+            if acp_brain.is_dir() {
+                sources.push(BrainSourceSpec {
+                    id: "t3".to_string(),
+                    label: "T3 Code".to_string(),
+                    dir: acp_brain,
+                });
+            }
+        }
+    }
+
+    sources
+}
+
+pub fn discover_default_brain_sources() -> Vec<BrainSourceSpec> {
+    if let Ok(env_dir) = std::env::var("ANTIGRAVITY_BRAIN_DIR") {
+        let trimmed = env_dir.trim();
+        if !trimmed.is_empty() {
+            let dir = PathBuf::from(trimmed);
+            let (id, label) = infer_source_from_dir(&dir);
+            return vec![BrainSourceSpec { id, label, dir }];
+        }
+    }
+    let home = dirs::home_dir();
+    discover_brain_sources_from_home(home.as_deref())
+}
+
 pub fn get_default_brain_dir() -> PathBuf {
     if let Ok(env_dir) = std::env::var("ANTIGRAVITY_BRAIN_DIR") {
         if !env_dir.trim().is_empty() {
@@ -104,7 +221,8 @@ fn extract_user_title(content: &str) -> String {
         .and_then(|c| c.get(1))
         .map(|m| m.as_str())
         .unwrap_or(content);
-    let no_tags = re_html_tags().replace_all(inner, " ");
+    let unwrapped = re_wrapped_system_blocks().replace_all(inner, " ");
+    let no_tags = re_html_tags().replace_all(&unwrapped, " ");
     let collapsed = re_whitespace().replace_all(&no_tags, " ");
     truncate_chars(collapsed.trim(), 84)
 }
@@ -201,6 +319,8 @@ pub struct SpawnedChild {
 #[derive(Debug, Clone)]
 pub struct ParsedSession {
     pub id: String,
+    pub source: String,
+    pub source_label: String,
     pub title: String,
     pub has_user_input: bool,
     pub system_sender_id: Option<String>,
@@ -428,6 +548,8 @@ pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
 
     ParsedSession {
         id: session_id.to_string(),
+        source: "app".to_string(),
+        source_label: "Antigravity App".to_string(),
         title: fallback_title,
         has_user_input,
         system_sender_id,
@@ -619,6 +741,8 @@ struct CacheEntry {
 
 pub struct ScanResult {
     pub brain_dir: String,
+    pub is_custom_dir: bool,
+    pub sources: Vec<UsageSourceInfo>,
     pub scanned_at: i64,
     pub error: Option<String>,
     pub total_dirs: usize,
@@ -627,151 +751,302 @@ pub struct ScanResult {
     pub sessions: Vec<ParsedSession>,
 }
 
+#[derive(Debug, Clone)]
+enum ScannerMode {
+    Auto,
+    Custom(PathBuf),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Explicit(Vec<BrainSourceSpec>),
+}
+
 pub struct BrainScanner {
-    pub brain_dir: PathBuf,
+    mode: ScannerMode,
     cache: HashMap<PathBuf, CacheEntry>,
+}
+
+fn canonical_source_order(id: &str) -> u8 {
+    match id {
+        "app" => 0,
+        "cli" => 1,
+        "t3" => 2,
+        "custom" => 3,
+        _ => 4,
+    }
+}
+
+fn path_dedup_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
 }
 
 impl BrainScanner {
     pub fn new(brain_dir: PathBuf) -> Self {
         Self {
-            brain_dir,
+            mode: ScannerMode::Custom(brain_dir),
+            cache: HashMap::new(),
+        }
+    }
+
+    pub fn new_auto() -> Self {
+        Self {
+            mode: ScannerMode::Auto,
+            cache: HashMap::new(),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new_sources(sources: Vec<BrainSourceSpec>) -> Self {
+        Self {
+            mode: ScannerMode::Explicit(sources),
             cache: HashMap::new(),
         }
     }
 
     pub fn set_dir(&mut self, brain_dir: PathBuf) {
-        self.brain_dir = brain_dir;
+        self.mode = ScannerMode::Custom(brain_dir);
         self.cache.clear();
     }
 
+    pub fn reset_to_auto(&mut self) {
+        self.mode = ScannerMode::Auto;
+        self.cache.clear();
+    }
+
+    pub fn is_custom_dir(&self) -> bool {
+        matches!(self.mode, ScannerMode::Custom(_))
+    }
+
+    pub fn primary_dir(&self) -> PathBuf {
+        match &self.mode {
+            ScannerMode::Custom(dir) => dir.clone(),
+            ScannerMode::Explicit(list) => list
+                .first()
+                .map(|s| s.dir.clone())
+                .unwrap_or_else(get_default_brain_dir),
+            ScannerMode::Auto => get_default_brain_dir(),
+        }
+    }
+
     pub fn scan(&mut self) -> ScanResult {
-        let dir_str = self.brain_dir.to_string_lossy().to_string();
-        let read_dir = match fs::read_dir(&self.brain_dir) {
-            Ok(rd) => rd,
-            Err(err) => {
-                let msg = if err.kind() == ErrorKind::NotFound {
-                    format!("目录不存在: {dir_str}")
-                } else {
-                    format!("无法读取目录: {err}")
-                };
-                return ScanResult {
-                    brain_dir: dir_str,
-                    scanned_at: now_ms(),
-                    error: Some(msg),
-                    total_dirs: 0,
-                    parsed_sessions: 0,
-                    skipped_dirs: 0,
-                    sessions: Vec::new(),
-                };
+        let is_custom_dir = self.is_custom_dir();
+        let raw_specs = match &self.mode {
+            ScannerMode::Auto => discover_default_brain_sources(),
+            ScannerMode::Custom(dir) => {
+                let (id, label) = infer_source_from_dir(dir);
+                vec![BrainSourceSpec {
+                    id,
+                    label,
+                    dir: dir.clone(),
+                }]
             }
+            ScannerMode::Explicit(list) => list.clone(),
         };
 
+        let mut seen_dirs: HashSet<String> = HashSet::new();
+        let mut specs: Vec<BrainSourceSpec> = Vec::new();
+        for spec in raw_specs {
+            let key = path_dedup_key(&spec.dir);
+            if !key.is_empty() && seen_dirs.insert(key) {
+                specs.push(spec);
+            }
+        }
+
+        let mut source_map: HashMap<String, UsageSourceInfo> = HashMap::new();
         let mut active_paths: HashSet<PathBuf> = HashSet::new();
-        let mut sessions: Vec<ParsedSession> = Vec::new();
+        let mut all_sessions: Vec<ParsedSession> = Vec::new();
         let mut total_dirs = 0usize;
         let mut skipped_dirs = 0usize;
+        let mut existing_dirs: Vec<String> = Vec::new();
 
-        for entry_res in read_dir {
-            let entry = match entry_res {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let ft = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
-                continue;
+        for spec in &specs {
+            let dir_str = spec.dir.to_string_lossy().to_string();
+            let info = source_map
+                .entry(spec.id.clone())
+                .or_insert_with(|| UsageSourceInfo {
+                    id: spec.id.clone(),
+                    label: spec.label.clone(),
+                    dirs: Vec::new(),
+                    exists: false,
+                    session_count: 0,
+                });
+            if !info.dirs.contains(&dir_str) {
+                info.dirs.push(dir_str.clone());
             }
-            total_dirs += 1;
 
-            let session_id = entry.file_name().to_string_lossy().to_string();
-            let session_dir = entry.path();
-            let mut found_path: Option<PathBuf> = None;
-            let mut found_meta: Option<fs::Metadata> = None;
-            let mut perm_denied = false;
-
-            for rel in TRANSCRIPT_CANDIDATES {
-                let candidate = session_dir.join(rel);
-                match fs::metadata(&candidate) {
-                    Ok(meta) if meta.is_file() => {
-                        found_path = Some(candidate);
-                        found_meta = Some(meta);
-                        break;
+            let read_dir = match fs::read_dir(&spec.dir) {
+                Ok(rd) => rd,
+                Err(err) => {
+                    if is_custom_dir {
+                        let msg = if err.kind() == ErrorKind::NotFound {
+                            format!("目录不存在: {dir_str}")
+                        } else {
+                            format!("无法读取目录: {err}")
+                        };
+                        let mut sources: Vec<UsageSourceInfo> = source_map.into_values().collect();
+                        sources.sort_by_key(|s| canonical_source_order(&s.id));
+                        return ScanResult {
+                            brain_dir: dir_str,
+                            is_custom_dir,
+                            sources,
+                            scanned_at: now_ms(),
+                            error: Some(msg),
+                            total_dirs: 0,
+                            parsed_sessions: 0,
+                            skipped_dirs: 0,
+                            sessions: Vec::new(),
+                        };
                     }
-                    Ok(_) => {}
+                    if err.kind() != ErrorKind::NotFound {
+                        skipped_dirs += 1;
+                    }
+                    continue;
+                }
+            };
+
+            info.exists = true;
+            existing_dirs.push(dir_str.clone());
+            let mut group_sessions: Vec<ParsedSession> = Vec::new();
+
+            for entry_res in read_dir {
+                let entry = match entry_res {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let ft = match entry.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if !ft.is_dir() {
+                    continue;
+                }
+                total_dirs += 1;
+
+                let session_id = entry.file_name().to_string_lossy().to_string();
+                let session_dir = entry.path();
+                let mut found_path: Option<PathBuf> = None;
+                let mut found_meta: Option<fs::Metadata> = None;
+                let mut perm_denied = false;
+
+                for rel in TRANSCRIPT_CANDIDATES {
+                    let candidate = session_dir.join(rel);
+                    match fs::metadata(&candidate) {
+                        Ok(meta) if meta.is_file() => {
+                            found_path = Some(candidate);
+                            found_meta = Some(meta);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                            perm_denied = true;
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                if perm_denied {
+                    skipped_dirs += 1;
+                    continue;
+                }
+
+                let (file_path, meta) = match (found_path, found_meta) {
+                    (Some(p), Some(m)) => (p, m),
+                    _ => continue,
+                };
+
+                let mtime_ms = meta.modified().map(system_time_to_ms).unwrap_or(0);
+                let size = meta.len();
+                active_paths.insert(file_path.clone());
+
+                if let Some(cached) = self.cache.get(&file_path) {
+                    if cached.mtime_ms == mtime_ms && cached.size == size {
+                        let mut sess = cached.session.clone();
+                        sess.source = spec.id.clone();
+                        sess.source_label = spec.label.clone();
+                        group_sessions.push(sess);
+                        continue;
+                    }
+                }
+
+                match fs::read_to_string(&file_path) {
+                    Ok(text) => {
+                        let mut parsed = parse_transcript_text(&text, &session_id);
+                        parsed.source = spec.id.clone();
+                        parsed.source_label = spec.label.clone();
+                        let fallback_ts = meta
+                            .created()
+                            .ok()
+                            .map(system_time_to_ms)
+                            .unwrap_or(mtime_ms);
+                        if parsed.started_at.is_none() {
+                            parsed.started_at = Some(fallback_ts);
+                        }
+                        if parsed.last_at.is_none() {
+                            parsed.last_at = Some(mtime_ms);
+                        }
+                        self.cache.insert(
+                            file_path,
+                            CacheEntry {
+                                mtime_ms,
+                                size,
+                                session: parsed.clone(),
+                            },
+                        );
+                        group_sessions.push(parsed);
+                    }
                     Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                        perm_denied = true;
-                        break;
+                        skipped_dirs += 1;
                     }
                     Err(_) => {}
                 }
             }
 
-            if perm_denied {
-                skipped_dirs += 1;
-                continue;
+            let mut resolved_group = resolve_session_graph(group_sessions);
+            for s in &mut resolved_group {
+                s.source = spec.id.clone();
+                s.source_label = spec.label.clone();
             }
-
-            let (file_path, meta) = match (found_path, found_meta) {
-                (Some(p), Some(m)) => (p, m),
-                _ => continue,
-            };
-
-            let mtime_ms = meta.modified().map(system_time_to_ms).unwrap_or(0);
-            let size = meta.len();
-            active_paths.insert(file_path.clone());
-
-            if let Some(cached) = self.cache.get(&file_path) {
-                if cached.mtime_ms == mtime_ms && cached.size == size {
-                    sessions.push(cached.session.clone());
-                    continue;
-                }
-            }
-
-            match fs::read_to_string(&file_path) {
-                Ok(text) => {
-                    let mut parsed = parse_transcript_text(&text, &session_id);
-                    let fallback_ts = meta
-                        .created()
-                        .ok()
-                        .map(system_time_to_ms)
-                        .unwrap_or(mtime_ms);
-                    if parsed.started_at.is_none() {
-                        parsed.started_at = Some(fallback_ts);
-                    }
-                    if parsed.last_at.is_none() {
-                        parsed.last_at = Some(mtime_ms);
-                    }
-                    self.cache.insert(
-                        file_path,
-                        CacheEntry {
-                            mtime_ms,
-                            size,
-                            session: parsed.clone(),
-                        },
-                    );
-                    sessions.push(parsed);
-                }
-                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    skipped_dirs += 1;
-                }
-                Err(_) => {}
-            }
+            info.session_count += resolved_group.len();
+            all_sessions.extend(resolved_group);
         }
 
         self.cache.retain(|k, _| active_paths.contains(k));
-        let resolved = resolve_session_graph(sessions);
+
+        let mut sources: Vec<UsageSourceInfo> = source_map.into_values().collect();
+        sources.sort_by_key(|s| canonical_source_order(&s.id));
+
+        let brain_dir_display = if !existing_dirs.is_empty() {
+            existing_dirs.join(" ; ")
+        } else {
+            self.primary_dir().to_string_lossy().to_string()
+        };
+
+        if !is_custom_dir && existing_dirs.is_empty() {
+            return ScanResult {
+                brain_dir: brain_dir_display,
+                is_custom_dir,
+                sources,
+                scanned_at: now_ms(),
+                error: Some("未找到任何可用的 Antigravity / CLI 日志目录".to_string()),
+                total_dirs: 0,
+                parsed_sessions: 0,
+                skipped_dirs,
+                sessions: Vec::new(),
+            };
+        }
 
         ScanResult {
-            brain_dir: dir_str,
+            brain_dir: brain_dir_display,
+            is_custom_dir,
+            sources,
             scanned_at: now_ms(),
             error: None,
             total_dirs,
-            parsed_sessions: resolved.len(),
+            parsed_sessions: all_sessions.len(),
             skipped_dirs,
-            sessions: resolved,
+            sessions: all_sessions,
         }
     }
 }
@@ -780,6 +1055,9 @@ impl BrainScanner {
 #[serde(rename_all = "camelCase")]
 pub struct UsageMeta {
     pub brain_dir: String,
+    pub is_custom_dir: bool,
+    pub sources: Vec<UsageSourceInfo>,
+    pub source_filter: String,
     pub scanned_at: i64,
     pub error: Option<String>,
     pub total_dirs: usize,
@@ -851,6 +1129,8 @@ pub struct ModelUsage {
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub id: String,
+    pub source: String,
+    pub source_label: String,
     pub title: String,
     pub is_subagent: bool,
     pub parent_id: Option<String>,
@@ -901,6 +1181,8 @@ pub struct UsageResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionDetailResponse {
     pub id: String,
+    pub source: String,
+    pub source_label: String,
     pub title: String,
     pub started_at: Option<i64>,
     pub last_at: Option<i64>,
@@ -985,6 +1267,7 @@ pub fn aggregate_usage(
     range_opt: Option<&str>,
     granularity_opt: Option<&str>,
     model_opt: Option<&str>,
+    source_opt: Option<&str>,
     day_opt: Option<&str>,
     now_override: Option<i64>,
 ) -> UsageResponse {
@@ -1017,6 +1300,7 @@ pub fn aggregate_usage(
         }
     };
     let model_filter = model_opt.filter(|m| !m.is_empty() && *m != "all");
+    let source_filter = source_opt.filter(|s| !s.is_empty() && *s != "all");
 
     let (range_start, range_end): (Option<i64>, Option<i64>) =
         if let Some((_, ref start_dt, ref end_dt)) = day_bounds {
@@ -1056,7 +1340,7 @@ pub fn aggregate_usage(
 
     struct ModelAgg {
         call_count: u64,
-        sessions: HashSet<String>,
+        sessions: HashSet<(String, String)>,
         input_tokens: u64,
         output_tokens: u64,
         cache_read_tokens: u64,
@@ -1072,6 +1356,11 @@ pub fn aggregate_usage(
     let mut max_event_ts: Option<i64> = None;
 
     for session in &scan_result.sessions {
+        if let Some(sf) = source_filter {
+            if session.source != sf {
+                continue;
+            }
+        }
         let mut sess_input = 0u64;
         let mut sess_output = 0u64;
         let mut sess_cache_read = 0u64;
@@ -1176,7 +1465,7 @@ pub fn aggregate_usage(
                 net_tokens: 0,
             });
             m_agg.call_count += 1;
-            m_agg.sessions.insert(session.id.clone());
+            m_agg.sessions.insert((session.source.clone(), session.id.clone()));
             m_agg.input_tokens += ev.input_tokens;
             m_agg.output_tokens += ev.output_tokens;
             m_agg.cache_read_tokens += ev.cache_read_tokens;
@@ -1216,6 +1505,8 @@ pub fn aggregate_usage(
             let duration_ms = (sess_last_ts.unwrap_or(0) - sess_first_ts.unwrap_or(0)).max(0);
             session_summaries.push(SessionSummary {
                 id: session.id.clone(),
+                source: session.source.clone(),
+                source_label: session.source_label.clone(),
                 title: session.title.clone(),
                 is_subagent: session.is_subagent,
                 parent_id: session.parent_id.clone(),
@@ -1351,6 +1642,9 @@ pub fn aggregate_usage(
     UsageResponse {
         meta: UsageMeta {
             brain_dir: scan_result.brain_dir.clone(),
+            is_custom_dir: scan_result.is_custom_dir,
+            sources: scan_result.sources.clone(),
+            source_filter: source_filter.unwrap_or("all").to_string(),
             scanned_at: scan_result.scanned_at,
             error: scan_result.error.clone(),
             total_dirs: scan_result.total_dirs,
@@ -1389,12 +1683,13 @@ fn iso_from_ms(ms: Option<i64>) -> String {
 pub fn build_sessions_csv(sessions: &[SessionSummary]) -> String {
     let mut lines = Vec::with_capacity(sessions.len() + 1);
     lines.push(
-        "session_id,kind,parent_id,title,started_at,last_at,primary_model,calls,tool_calls,input_tokens,output_tokens,cache_read_tokens,net_tokens,total_tokens,cache_hit_rate"
+        "session_id,source,kind,parent_id,title,started_at,last_at,primary_model,calls,tool_calls,input_tokens,output_tokens,cache_read_tokens,net_tokens,total_tokens,cache_hit_rate"
             .to_string(),
     );
     for s in sessions {
         let row = [
             s.id.clone(),
+            s.source_label.clone(),
             if s.is_subagent {
                 "subagent".to_string()
             } else {
@@ -1488,6 +1783,8 @@ mod tests {
         // Single-day hourly drill-down returns exact 24 hourly buckets
         let scan = ScanResult {
             brain_dir: "test".to_string(),
+            is_custom_dir: false,
+            sources: vec![],
             scanned_at: 0,
             error: None,
             total_dirs: 2,
@@ -1495,12 +1792,97 @@ mod tests {
             skipped_dirs: 0,
             sessions: resolved,
         };
-        let agg = aggregate_usage(&scan, Some("7d"), None, None, Some("2026-11-18"), None);
+        let agg = aggregate_usage(&scan, Some("7d"), None, None, None, Some("2026-11-18"), None);
         assert_eq!(agg.meta.range, "day");
         assert_eq!(agg.meta.granularity, "hour");
         assert_eq!(agg.meta.selected_day.as_deref(), Some("2026-11-18"));
         assert_eq!(agg.series.len(), 24);
         assert_eq!(agg.summary.call_count, 2);
         assert_eq!(agg.summary.total_tokens, 15700);
+    }
+
+    #[test]
+    fn strips_t3_bootstrap_tags_for_session_title() {
+        let t3_txt = [
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-24T11:08:22Z","content":"<USER_REQUEST>\n<t3_code_instructions>\n## T3 Code interaction mode\n</t3_code_instructions>\n<runtime_info>Some runtime info</runtime_info>\n</USER_REQUEST>\n<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>"}"#,
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T11:08:22Z","model":"gemini-pro-orchestrator-neon","input_tokens":8000,"output_tokens":60,"cache_read_tokens":0}"#,
+            r#"{"step_index":2,"type":"USER_INPUT","created_at":"2026-11-24T11:08:42Z","content":"<USER_REQUEST>\n在当前目录下写一个 py 输出 hello world<runtime_info>In case you're asked: running in T3 Code</runtime_info>\n</USER_REQUEST>"}"#,
+            r#"{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T11:08:45Z","model":"gemini-4-hydrogen-medium","input_tokens":3400,"output_tokens":200,"cache_read_tokens":1000}"#,
+        ]
+        .join("\n");
+
+        let parsed = parse_transcript_text(&t3_txt, "e3604c40-t3");
+        assert!(parsed.has_user_input);
+        assert_eq!(parsed.title, "在当前目录下写一个 py 输出 hello world");
+        assert_eq!(parsed.events.len(), 2);
+    }
+
+    #[test]
+    fn scans_and_filters_multiple_sources_independently() {
+        let tmp = std::env::temp_dir().join(format!("agydock_multi_src_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let app_dir = tmp.join(".gemini").join("antigravity").join("brain");
+        let cli_dir = tmp.join(".gemini").join("antigravity-cli").join("brain");
+        let t3_dir = tmp
+            .join(".t3")
+            .join("userdata")
+            .join("providers")
+            .join("antigravity")
+            .join("abc123")
+            .join("antigravity-acp")
+            .join("brain");
+
+        fs::create_dir_all(app_dir.join("s-app").join(".system_generated").join("logs")).unwrap();
+        fs::create_dir_all(cli_dir.join("s-cli").join(".system_generated").join("logs")).unwrap();
+        fs::create_dir_all(t3_dir.join("s-t3").join(".system_generated").join("logs")).unwrap();
+
+        fs::write(
+            app_dir.join("s-app/.system_generated/logs/transcript.jsonl"),
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-24T10:00:00Z","content":"<USER_REQUEST>App 任务</USER_REQUEST>"}
+{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T10:00:05Z","model":"gemini-4-neon-high","input_tokens":1000,"output_tokens":100,"cache_read_tokens":0}"#,
+        )
+        .unwrap();
+        fs::write(
+            cli_dir.join("s-cli/.system_generated/logs/transcript.jsonl"),
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-24T11:00:00Z","content":"<USER_REQUEST>CLI 任务</USER_REQUEST>"}
+{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T11:00:05Z","model":"gemini-4-neon-high","input_tokens":2000,"output_tokens":200,"cache_read_tokens":0}"#,
+        )
+        .unwrap();
+        fs::write(
+            t3_dir.join("s-t3/.system_generated/logs/transcript.jsonl"),
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-24T12:00:00Z","content":"<USER_REQUEST><t3_code_instructions>boot</t3_code_instructions></USER_REQUEST>"}
+{"step_index":1,"type":"USER_INPUT","created_at":"2026-11-24T12:00:02Z","content":"<USER_REQUEST>T3 任务</USER_REQUEST>"}
+{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T12:00:05Z","model":"gemini-4-hydrogen-medium","input_tokens":3000,"output_tokens":300,"cache_read_tokens":0}"#,
+        )
+        .unwrap();
+
+        let discovered = discover_brain_sources_from_home(Some(&tmp));
+        assert_eq!(discovered.len(), 3);
+
+        let mut scanner = BrainScanner::new_sources(discovered);
+        let scan_res = scanner.scan();
+        assert!(scan_res.error.is_none());
+        assert!(!scan_res.is_custom_dir);
+        assert_eq!(scan_res.parsed_sessions, 3);
+        assert_eq!(scan_res.sources.len(), 3);
+
+        let agg_all = aggregate_usage(&scan_res, Some("all"), None, None, None, None, None);
+        assert_eq!(agg_all.summary.session_count, 3);
+        assert_eq!(agg_all.summary.total_tokens, 6600);
+        assert_eq!(agg_all.meta.source_filter, "all");
+
+        let agg_t3 = aggregate_usage(&scan_res, Some("all"), None, None, Some("t3"), None, None);
+        assert_eq!(agg_t3.summary.session_count, 1);
+        assert_eq!(agg_t3.summary.total_tokens, 3300);
+        assert_eq!(agg_t3.sessions[0].source, "t3");
+        assert_eq!(agg_t3.sessions[0].source_label, "T3 Code");
+        assert_eq!(agg_t3.sessions[0].title, "T3 任务");
+        assert_eq!(agg_t3.meta.sources.len(), 3);
+
+        let csv = build_sessions_csv(&agg_t3.sessions);
+        assert!(csv.starts_with("\u{FEFF}session_id,source,"));
+        assert!(csv.contains("T3 Code"));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
