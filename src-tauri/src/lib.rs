@@ -5,10 +5,14 @@ mod scanner;
 
 use accounts::{AccountEntry, AccountHealth, AccountStore, AccountsList, CurrentCredential};
 use proxy::{
-    build_dry_run_preview, build_snapshot, flush_dns_cache, get_antigravity_runtime_status,
-    launch_antigravity_after_stop, launch_isolated_antigravity, open_verify_report, resolve_port,
-    run_cumulative_audit, start_clash_verge, stop_antigravity_processes, ActionResponse,
-    AntigravityRuntimeStatus, AuditProgressPayload, AuditResult, ProxySettings, ProxySnapshot,
+    build_cli_shell_snippets, build_dry_run_preview, build_snapshot, detect_cli_and_tools,
+    disable_cli_shim, enable_cli_shim, flush_dns_cache, get_antigravity_runtime_status,
+    launch_antigravity_after_stop, launch_isolated_antigravity, launch_isolated_cli_terminal,
+    launch_isolated_cli_tool, open_verify_report, resolve_port, run_cumulative_audit,
+    start_clash_verge, stop_antigravity_processes, stop_cli_processes, stop_cli_tool_processes,
+    sync_cli_shim_if_enabled, test_cli_proxy, ActionResponse, AntigravityRuntimeStatus,
+    AuditProgressPayload, AuditResult, CliDetectResult, CliShellSnippets, ProxySettings,
+    ProxySnapshot,
 };
 use scanner::{
     aggregate_usage, build_sessions_csv, get_default_brain_dir, load_persisted_brain_dir,
@@ -944,6 +948,7 @@ fn proxy_save_settings(
 ) -> Result<ProxySettings, String> {
     let clean = settings.sanitized();
     clean.save();
+    let _ = sync_cli_shim_if_enabled(&clean);
     let mut guard = state
         .proxy_settings
         .lock()
@@ -969,8 +974,13 @@ fn proxy_browse_path(kind: String, current: Option<String>) -> Result<BrowseResu
     let cur_str = current.unwrap_or_default();
     let cur_path = Path::new(cur_str.trim());
 
-    if kind == "workspace" {
-        let mut dlg = rfd::FileDialog::new().set_title("选择要在 Antigravity 中打开的工作区目录");
+    if kind == "workspace" || kind == "tool_dir" {
+        let title = if kind == "tool_dir" {
+            "选择外部工具的工作目录"
+        } else {
+            "选择要在 Antigravity 中打开的工作区目录"
+        };
+        let mut dlg = rfd::FileDialog::new().set_title(title);
         if cur_path.is_dir() {
             dlg = dlg.set_directory(cur_path);
         }
@@ -986,16 +996,19 @@ fn proxy_browse_path(kind: String, current: Option<String>) -> Result<BrowseResu
         });
     }
 
-    let (title, default_file) = if kind == "clash" {
-        ("选择 clash-verge.exe", "clash-verge.exe")
-    } else {
-        ("选择 Antigravity.exe", "Antigravity.exe")
+    let (title, default_file, extensions): (&str, &str, &[&str]) = match kind.as_str() {
+        "clash" => ("选择 clash-verge.exe", "clash-verge.exe", &["exe"]),
+        "cli" => ("选择 Antigravity CLI (agy.exe)", "agy.exe", &["exe"]),
+        "tool" => ("选择外部 CLI 工具可执行文件", "", &["exe", "cmd", "bat"]),
+        _ => ("选择 Antigravity.exe", "Antigravity.exe", &["exe"]),
     };
 
     let mut dlg = rfd::FileDialog::new()
         .set_title(title)
-        .set_file_name(default_file)
-        .add_filter("可执行文件", &["exe"]);
+        .add_filter("可执行文件", extensions);
+    if !default_file.is_empty() {
+        dlg = dlg.set_file_name(default_file);
+    }
     if let Some(parent) = cur_path.parent() {
         if parent.is_dir() {
             dlg = dlg.set_directory(parent);
@@ -1012,6 +1025,160 @@ fn proxy_browse_path(kind: String, current: Option<String>) -> Result<BrowseResu
             path: cur_str,
         },
     })
+}
+
+#[tauri::command]
+async fn proxy_detect_cli_and_tools() -> Result<CliDetectResult, String> {
+    tauri::async_runtime::spawn_blocking(detect_cli_and_tools)
+        .await
+        .map_err(|e| format!("Detect CLI task failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_launch_cli_tool(
+    state: State<'_, AppState>,
+    tool_id: String,
+    force_restart: bool,
+) -> Result<ActionResponse, String> {
+    let Some(run_guard) = AtomicFlagGuard::try_acquire(&state.launch_running) else {
+        return Ok(ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs: vec!["[i] 正在执行启动任务，请勿重复点击。".to_string()],
+            error: None,
+        });
+    };
+
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let _run_guard = run_guard;
+        launch_isolated_cli_tool(&settings, &tool_id, force_restart)
+    })
+    .await
+    .map_err(|e| format!("Launch tool task failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_stop_cli_tool(
+    state: State<'_, AppState>,
+    tool_id: String,
+) -> Result<ActionResponse, String> {
+    let tool = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .cli_tools
+        .iter()
+        .find(|t| t.id == tool_id)
+        .cloned();
+
+    let Some(tool) = tool else {
+        let msg = format!("找不到指定的 CLI 工具配置: {tool_id}");
+        return Ok(ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs: vec![format!("[X] {msg}")],
+            error: Some(msg),
+        });
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let (ok, logs) = stop_cli_tool_processes(&tool.exe_path, &tool.name);
+        ActionResponse {
+            ok,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs,
+            error: None,
+        }
+    })
+    .await
+    .map_err(|e| format!("Stop tool task failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_stop_cli_processes() -> Result<ActionResponse, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let (ok, logs) = stop_cli_processes();
+        ActionResponse {
+            ok,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs,
+            error: None,
+        }
+    })
+    .await
+    .map_err(|e| format!("Stop CLI task failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_enable_cli_shim(state: State<'_, AppState>) -> Result<ActionResponse, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || enable_cli_shim(&settings))
+        .await
+        .map_err(|e| format!("Enable CLI shim failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_disable_cli_shim() -> Result<ActionResponse, String> {
+    tauri::async_runtime::spawn_blocking(disable_cli_shim)
+        .await
+        .map_err(|e| format!("Disable CLI shim failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_launch_cli_terminal(state: State<'_, AppState>) -> Result<ActionResponse, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || launch_isolated_cli_terminal(&settings))
+        .await
+        .map_err(|e| format!("Launch CLI terminal failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_test_cli(state: State<'_, AppState>) -> Result<ActionResponse, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || test_cli_proxy(&settings))
+        .await
+        .map_err(|e| format!("Test CLI failed: {e}"))
+}
+
+#[tauri::command]
+async fn proxy_cli_snippets(state: State<'_, AppState>) -> Result<CliShellSnippets, String> {
+    let settings = state
+        .proxy_settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned")?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, _, _, _) = resolve_port(&settings);
+        build_cli_shell_snippets(&settings, port)
+    })
+    .await
+    .map_err(|e| format!("Build CLI snippets failed: {e}"))
 }
 
 #[tauri::command]
@@ -1487,6 +1654,15 @@ pub fn run() {
             proxy_save_settings,
             proxy_get_snapshot,
             proxy_browse_path,
+            proxy_detect_cli_and_tools,
+            proxy_launch_cli_tool,
+            proxy_stop_cli_tool,
+            proxy_stop_cli_processes,
+            proxy_enable_cli_shim,
+            proxy_disable_cli_shim,
+            proxy_launch_cli_terminal,
+            proxy_test_cli,
+            proxy_cli_snippets,
             proxy_launch_antigravity,
             proxy_stop_antigravity,
             proxy_start_clash,

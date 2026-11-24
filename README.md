@@ -16,9 +16,13 @@
   - 顶栏一键切换 **用量看板 / 隔离代理** 双模块，完全免去 `.NET 8 Desktop Runtime` 依赖；
   - **隔离代理模块**（原生 Win32 API 实现，完整移植自 `AntigravityTunPanel`）：
     - 仅让 Antigravity 及其 `language_server` 子进程走本地代理（`--proxy-server` + `HTTP_PROXY/HTTPS_PROXY/NODE_USE_ENV_PROXY=1`），不开 TUN、不改系统代理；
+    - **独立代理 Antigravity CLI（`agy`）与接入工具（如 T3 Code）**：
+      - 自动探测本机 `agy.exe`（包括 `PATH` 及 T3 Code 内置 `antigravity-acp` 版本），支持**打开仅当前窗口生效的隔离代理终端**、一键执行 `agy models` 验证连通性、以及复制 PowerShell / CMD / Bash 代理环境变量命令；
+      - 支持**可逆 CLI Proxy Shim**（在 `%LOCALAPPDATA%\AgyDock\cli-shim` 生成包装脚本并前置到用户 `PATH`，不修改原 `agy.exe` 与系统代理/全局环境变量，可一键停用并清理）；
+      - 内置**外部工具独立启动与监控**（自动识别 **T3 Code** 并支持添加任意自定义工具）：Electron/Chromium 工具同时注入代理参数与环境变量，普通 CLI 工具仅注入环境变量，使其拉起的 `agy.exe acp` 子进程自动走本地代理；
     - **国内/内网直连绕过（防风控）**：默认自动绕过 `.cn`、国内常用站点/云服务/镜像与局域网私网段（同步生成 Chromium `--proxy-bypass-list` 与 `NO_PROXY`），并支持自定义直连域名与 Clash Global 模式告警，避免从 Antigravity 访问国内站点走海外节点触发风控；
     - 自动读取 Clash Verge 配置与端口探测、启动时自动拉起 Clash Verge、只读检测 Windows 系统代理与 TUN 虚拟网卡；
-    - 基于 Win32 `GetExtendedTcpTable` 实时扫描 TCP 连接明细（区分 `走代理`、`TUN Fake-IP`、`公网直连`、`本地 IPC`）；
+    - 基于 Win32 `GetExtendedTcpTable` 实时扫描 TCP 连接明细（同步覆盖 `Antigravity`、`language_server`、`agy` CLI 与受监控工具，区分 `走代理`、`TUN Fake-IP`、`公网直连`、`本地 IPC`）；
     - 支持「验收 20s」累计检查并生成验收报告、刷新 DNS、启动参数预览、结束进程与可折叠路径配置；
   - **用量看板桌面增强**：顶栏 **目录** 按钮支持原生文件夹选择并记住配置（按住 `Shift` 或点击「恢复自动多来源聚合」恢复默认）；**导出 CSV** 弹出系统原生「另存为」框。
   - **账号管理（多账号，免重复登录）**：

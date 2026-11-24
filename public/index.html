@@ -295,7 +295,7 @@
     <div class="audit-bar hidden" id="proxyAuditBar">
       <div class="audit-head mono">
         <span id="proxyAuditLabel">验收中 0/20s</span>
-        <span>请在 Antigravity 中发一条消息触发模型请求</span>
+        <span>请在 Antigravity、agy CLI 或接入工具中触发模型请求</span>
       </div>
       <div class="audit-track"><div class="audit-fill" id="proxyAuditFill"></div></div>
     </div>
@@ -387,6 +387,15 @@
         </div>
 
         <div class="field-row">
+          <label class="field-label" for="proxyInputCliPath">Antigravity CLI 路径</label>
+          <div class="field-path">
+            <input type="text" id="proxyInputCliPath" class="text-input mono flex-1" placeholder="agy.exe 路径（可自动探测 PATH 或 T3 Code 内置版本）" />
+            <button type="button" class="btn" id="proxyBtnBrowseCli">浏览</button>
+            <button type="button" class="btn" id="proxyBtnDetectCli">重新探测</button>
+          </div>
+        </div>
+
+        <div class="field-row">
           <label class="field-label" for="proxyInputClashPath">Clash Verge 路径</label>
           <div class="field-path">
             <input type="text" id="proxyInputClashPath" class="text-input mono flex-1" />
@@ -402,6 +411,90 @@
             <button type="button" class="btn" id="proxyBtnClearWorkspace">清空</button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- CLI & External Tools Isolation Panel -->
+    <section class="panel" id="proxyCliPanel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">CLI 与工具独立代理</h2>
+          <span class="tag mono" id="proxyCliStatusTag">检测中...</span>
+          <span class="tag mono" id="proxyShimStatusTag">Shim 未启用</span>
+        </div>
+        <div class="panel-actions cli-header-actions">
+          <button type="button" class="btn btn-primary" id="proxyBtnCliTerminal" title="打开仅在当前终端窗口注入代理变量的命令行（含 agy PATH）">打开代理终端</button>
+          <button type="button" class="btn" id="proxyBtnTestCli" title="使用当前隔离代理执行 agy models 验证连通性">测试 CLI</button>
+          <button type="button" class="btn" id="proxyBtnToggleShim" title="在用户 PATH 写入隔离代理脚本（不改动原 agy.exe 与系统代理）">启用 CLI Shim</button>
+          <button type="button" class="btn hidden" id="proxyBtnSyncShim" title="代理端口或直连规则已变更，点击同步更新 Shim 脚本">同步 Shim</button>
+          <button type="button" class="btn" id="proxyBtnCopySnippets" title="复制 PowerShell 代理变量命令，并在日志中输出 CMD / Bash 命令">复制终端命令</button>
+          <button type="button" class="btn btn-danger-subtle hidden" id="proxyBtnStopCli" title="结束当前运行的 agy CLI 进程">结束 CLI</button>
+          <button type="button" class="btn" id="proxyBtnAddTool">添加工具</button>
+        </div>
+      </div>
+
+      <div class="cli-tool-form hidden" id="proxyToolForm">
+        <div class="settings-grid">
+          <div class="field-row">
+            <label class="field-label" for="proxyToolName">工具名称</label>
+            <div class="field-inline">
+              <input type="text" id="proxyToolName" class="text-input" placeholder="例如 T3 Code 或自定义工具名" style="width: 220px;" />
+              <label class="check-label" title="Electron / Chromium 应用需同时传入 --proxy-server 与 --proxy-bypass-list；普通 CLI/工具仅注入代理环境变量">
+                <input type="checkbox" id="proxyToolIsChromium" checked />
+                <span>Electron/Chromium 模式</span>
+              </label>
+              <label class="check-label" title="在连接明细与进程面板中自动跟踪该工具的 TCP 连接">
+                <input type="checkbox" id="proxyToolMonitor" checked />
+                <span>监控进程与连接</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <label class="field-label" for="proxyToolExePath">程序路径</label>
+            <div class="field-path">
+              <input type="text" id="proxyToolExePath" class="text-input mono flex-1" placeholder="选择 .exe / .cmd / .bat 可执行文件" />
+              <button type="button" class="btn" id="proxyToolBrowseExe">浏览</button>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <label class="field-label" for="proxyToolArgs">附加参数 (可选)</label>
+            <div class="field-path">
+              <input type="text" id="proxyToolArgs" class="text-input mono flex-1" placeholder="可选启动参数，例如 --profile dev" />
+            </div>
+          </div>
+
+          <div class="field-row">
+            <label class="field-label" for="proxyToolWorkDir">工作目录 (可选)</label>
+            <div class="field-path">
+              <input type="text" id="proxyToolWorkDir" class="text-input mono flex-1" placeholder="留空则默认使用可执行文件所在目录" />
+              <button type="button" class="btn" id="proxyToolBrowseDir">浏览</button>
+              <button type="button" class="btn" id="proxyToolSaveBtn">保存工具</button>
+              <button type="button" class="btn" id="proxyToolCancelBtn">取消</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>工具与路径</th>
+              <th style="width: 148px;">代理模式</th>
+              <th style="width: 112px;">运行状态</th>
+              <th style="width: 248px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="proxyCliToolsBody">
+            <tr class="empty-row"><td colspan="4">正在扫描 CLI 工具配置...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="cli-shim-bar mono" id="proxyCliMetaBar">
+        <span id="proxyCliMetaText">CLI: 检测中...</span>
       </div>
     </section>
 
@@ -423,7 +516,7 @@
           <button type="button" class="btn" id="proxyBtnStartClash">Clash Verge</button>
           <button type="button" class="btn" id="proxyBtnFlushDns">刷新 DNS</button>
           <button type="button" class="btn" id="proxyBtnDryRun">参数预览</button>
-          <button type="button" class="btn btn-danger-subtle" id="proxyBtnStopAgy">结束进程</button>
+          <button type="button" class="btn btn-danger-subtle" id="proxyBtnStopAgy" title="关闭 Antigravity 与 language_server 进程">结束 Antigravity</button>
           <span class="panel-actions hidden" id="proxyLogTools">
             <button type="button" class="btn" id="proxyBtnOpenReport">打开报告</button>
             <button type="button" class="btn" id="proxyBtnCopyLog">复制</button>
