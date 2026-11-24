@@ -268,6 +268,10 @@
       <span>检测到 Windows 系统代理或 TUN 网卡处于开启状态。若要仅隔离 Antigravity 流量，请在 Clash Verge 中关闭「系统代理」和「Tun 模式」（保持端口监听即可）。</span>
     </div>
 
+    <div class="notice hidden" id="proxyGlobalWarnBanner">
+      <span>检测到 Clash Verge 当前处于 Global（全局）模式：未命中直连绕过列表的国内站点仍会走海外代理节点，容易触发风控无法访问。建议在 Clash Verge 中切换为 Rule（规则）模式，或在「设置 → 自定义直连域名」中添加对应域名后重启 Antigravity。</span>
+    </div>
+
     <div class="notice notice-confirm hidden" id="proxyConfirmBanner">
       <span id="proxyConfirmText"></span>
       <div class="confirm-actions">
@@ -335,6 +339,10 @@
         <div class="field-row">
           <label class="field-label">启动选项</label>
           <div class="field-inline">
+            <label class="check-label" title="让 .cn、国内常用站点与局域网 IP 绕过本地代理直接连接，避免访问国内网站走海外节点触发风控（修改后需重启 Antigravity 生效）">
+              <input type="checkbox" id="proxyChkBypassChina" checked />
+              <span>国内/内网直连绕过（防风控）</span>
+            </label>
             <label class="check-label">
               <input type="checkbox" id="proxyChkAutoClash" checked />
               <span>端口未监听时自动启动 Clash Verge</span>
@@ -347,6 +355,14 @@
               <input type="checkbox" id="proxyChkAutoRefresh" checked />
               <span>自动刷新 (1.5s)</span>
             </label>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label" for="proxyInputCustomBypass">自定义直连域名</label>
+          <div class="field-path">
+            <input type="text" id="proxyInputCustomBypass" class="text-input mono flex-1" placeholder="可选，逗号/空格分隔，如 example.com, 10.20.0.0/16（修改后重启生效）" />
+            <button type="button" class="btn" id="proxyBtnClearBypass">清空</button>
           </div>
         </div>
 

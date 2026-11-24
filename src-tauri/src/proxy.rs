@@ -96,6 +96,85 @@ fn default_clash_verge_path() -> String {
         .unwrap_or_default()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// 内置国内常用域名后缀（不含 .cn，.cn 已单独通配），用于在启用「国内/内网直连绕过」时
+/// 避免访问国内站点走海外代理节点触发风控。
+const CHINA_DIRECT_DOMAINS: &[&str] = &[
+    "baidu.com",
+    "bdstatic.com",
+    "bcebos.com",
+    "qq.com",
+    "gtimg.com",
+    "qcloud.com",
+    "myqcloud.com",
+    "tencent.com",
+    "tencentcloudapi.com",
+    "alibaba.com",
+    "alicdn.com",
+    "aliyun.com",
+    "aliyuncs.com",
+    "taobao.com",
+    "tmall.com",
+    "alipay.com",
+    "dingtalk.com",
+    "1688.com",
+    "amap.com",
+    "npmmirror.com",
+    "yuque.com",
+    "bytedance.com",
+    "byteimg.com",
+    "douyin.com",
+    "toutiao.com",
+    "larkoffice.com",
+    "volces.com",
+    "volcengine.com",
+    "jd.com",
+    "360buyimg.com",
+    "pinduoduo.com",
+    "meituan.com",
+    "dianping.com",
+    "ctrip.com",
+    "bilibili.com",
+    "hdslb.com",
+    "zhihu.com",
+    "zhimg.com",
+    "weibo.com",
+    "sina.com",
+    "xiaohongshu.com",
+    "xhscdn.com",
+    "douban.com",
+    "163.com",
+    "126.net",
+    "csdn.net",
+    "cnblogs.com",
+    "oschina.net",
+    "gitee.com",
+    "segmentfault.com",
+    "mi.com",
+    "xiaomi.com",
+    "huawei.com",
+    "huaweicloud.com",
+    "deepseek.com",
+    "baichuan-ai.com",
+    "qiniu.com",
+    "qiniucdn.com",
+    "upyun.com",
+    "ccb.com",
+    "icbc.com",
+    "cmbchina.com",
+    "abchina.com",
+];
+
+const LAN_BYPASS_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySettings {
@@ -108,6 +187,10 @@ pub struct ProxySettings {
     pub auto_start_clash: bool,
     pub disable_quic: bool,
     pub show_loopback_ipc: bool,
+    #[serde(default = "default_true")]
+    pub bypass_china_and_lan: bool,
+    #[serde(default)]
+    pub custom_bypass_domains: String,
 }
 
 impl Default for ProxySettings {
@@ -122,6 +205,8 @@ impl Default for ProxySettings {
             auto_start_clash: true,
             disable_quic: true,
             show_loopback_ipc: false,
+            bypass_china_and_lan: true,
+            custom_bypass_domains: String::new(),
         }
     }
 }
@@ -147,6 +232,7 @@ impl ProxySettings {
             self.clash_verge_path = self.clash_verge_path.trim().to_string();
         }
         self.workspace_path = self.workspace_path.trim().to_string();
+        self.custom_bypass_domains = self.custom_bypass_domains.trim().to_string();
         self
     }
 
@@ -193,7 +279,7 @@ impl ConnectionCategory {
             Self::Proxied => "走代理",
             Self::TunFakeIp => "TUN Fake-IP",
             Self::PublicDirect => "公网直连",
-            Self::LocalIpc => "本地 IPC",
+            Self::LocalIpc => "本地/内网",
         }
     }
 
@@ -464,6 +550,27 @@ pub fn resolve_port(settings: &ProxySettings) -> (u16, String, bool, String) {
     (7897, "默认端口".to_string(), false, mode)
 }
 
+fn is_local_or_private_ip(host: &str) -> bool {
+    if let Ok(ip) = host.trim().parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+            }
+            IpAddr::V6(v6) => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (seg0 & 0xfe00) == 0xfc00
+                    || (seg0 & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    host.starts_with("127.") || host == "0.0.0.0" || host == "::1" || host == "::"
+}
+
 pub fn classify_remote(
     remote_host: &str,
     remote_port: u16,
@@ -482,11 +589,7 @@ pub fn classify_remote(
         return ConnectionCategory::TunFakeIp;
     }
 
-    if remote_host.starts_with("127.")
-        || remote_host == "0.0.0.0"
-        || remote_host == "::1"
-        || remote_host == "::"
-    {
+    if is_local_or_private_ip(remote_host) {
         return ConnectionCategory::LocalIpc;
     }
 
@@ -1114,6 +1217,136 @@ pub fn get_antigravity_runtime_status(settings: &ProxySettings) -> AntigravityRu
     }
 }
 
+fn normalize_custom_bypass_entry(raw: &str) -> Option<String> {
+    let mut s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        s = rest.to_string();
+    }
+    if let Some(idx) = s.find(['/', '?', '#']) {
+        // 保留 CIDR 网段中的 /prefix（例如 10.20.0.0/16）
+        let is_cidr = s
+            .split_once('/')
+            .map(|(ip_part, prefix)| {
+                ip_part.parse::<IpAddr>().is_ok() && prefix.parse::<u8>().is_ok()
+            })
+            .unwrap_or(false);
+        if !is_cidr {
+            s.truncate(idx);
+        }
+    }
+    if !s.contains('/') && !s.starts_with('[') && s.matches(':').count() == 1 {
+        if let Some((host, port)) = s.split_once(':') {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                s = host.to_string();
+            }
+        }
+    }
+    let s = s.trim_start_matches("*.").trim_start_matches('.').trim();
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '/' | '[' | ']'))
+    {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// 生成 Chromium `--proxy-bypass-list` 与通用环境变量 `NO_PROXY` 规则列表。
+///
+/// - Chromium 支持 `domain;*.domain`、`*.cn`、CIDR 与 `<local>`；
+/// - Go / Node (`NODE_USE_ENV_PROXY=1`) / curl / Python 的 `NO_PROXY` 使用 `.domain` 后缀与 CIDR（不带 `*`）。
+pub fn build_bypass_lists(settings: &ProxySettings) -> (String, String, usize) {
+    let mut chromium: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "[::1]".to_string(),
+        "<local>".to_string(),
+    ];
+    let mut no_proxy: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        "[::1]".to_string(),
+    ];
+
+    let mut seen_domains: HashSet<String> = HashSet::new();
+
+    if settings.bypass_china_and_lan {
+        for cidr in LAN_BYPASS_CIDRS {
+            chromium.push((*cidr).to_string());
+            no_proxy.push((*cidr).to_string());
+        }
+        for suffix in ["local", "lan", "cn"] {
+            chromium.push(format!("*.{suffix}"));
+            no_proxy.push(format!(".{suffix}"));
+            seen_domains.insert(suffix.to_string());
+        }
+        for domain in CHINA_DIRECT_DOMAINS {
+            if seen_domains.insert((*domain).to_string()) {
+                chromium.push((*domain).to_string());
+                chromium.push(format!("*.{domain}"));
+                no_proxy.push(format!(".{domain}"));
+            }
+        }
+    }
+
+    let mut custom_count = 0usize;
+    for token in settings
+        .custom_bypass_domains
+        .split(|c: char| matches!(c, ',' | ';' | '\n' | '\r' | '\t' | ' '))
+    {
+        let Some(clean) = normalize_custom_bypass_entry(token) else {
+            continue;
+        };
+        if !seen_domains.insert(clean.clone()) {
+            continue;
+        }
+        custom_count += 1;
+        let is_ip_or_cidr = clean.contains('/') || clean.parse::<IpAddr>().is_ok() || clean.starts_with('[');
+        if is_ip_or_cidr {
+            chromium.push(clean.clone());
+            no_proxy.push(clean);
+        } else if !clean.contains('.') {
+            chromium.push(clean.clone());
+            chromium.push(format!("*.{clean}"));
+            no_proxy.push(format!(".{clean}"));
+        } else {
+            chromium.push(clean.clone());
+            chromium.push(format!("*.{clean}"));
+            no_proxy.push(format!(".{clean}"));
+        }
+    }
+
+    (chromium.join(";"), no_proxy.join(","), custom_count)
+}
+
+fn apply_proxy_env_and_args(cmd: &mut Command, settings: &ProxySettings, proxy_url: &str) {
+    let (chromium_bypass, env_no_proxy, _) = build_bypass_lists(settings);
+    cmd.arg(format!("--proxy-server={proxy_url}"));
+    cmd.arg(format!("--proxy-bypass-list={chromium_bypass}"));
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        cmd.env(key, proxy_url);
+    }
+    for key in ["NO_PROXY", "no_proxy"] {
+        cmd.env(key, &env_no_proxy);
+    }
+    cmd.env("NODE_USE_ENV_PROXY", "1");
+}
+
 /// 账号切换后重启 Antigravity：调用前进程应已停止。
 ///
 /// 与 `launch_isolated_antigravity` 的区别：若代理端口未监听且开启了自动拉起 Clash，
@@ -1153,23 +1386,15 @@ pub fn launch_antigravity_after_stop(settings: &ProxySettings) -> (bool, Vec<Str
 
     match &proxy_url {
         Some(url) => {
-            cmd.arg(format!("--proxy-server={url}"));
-            cmd.arg("--proxy-bypass-list=localhost;127.0.0.1;[::1]");
-            for key in [
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "ALL_PROXY",
-                "http_proxy",
-                "https_proxy",
-                "all_proxy",
-            ] {
-                cmd.env(key, url);
-            }
-            for key in ["NO_PROXY", "no_proxy"] {
-                cmd.env(key, "localhost,127.0.0.1,::1,[::1]");
-            }
-            cmd.env("NODE_USE_ENV_PROXY", "1");
-            logs.push(format!("[OK] Antigravity 已以隔离代理方式启动 -> {url}"));
+            apply_proxy_env_and_args(&mut cmd, settings, url);
+            let bypass_note = if settings.bypass_china_and_lan {
+                "（已启用国内/内网直连绕过）"
+            } else {
+                ""
+            };
+            logs.push(format!(
+                "[OK] Antigravity 已以隔离代理方式启动 -> {url}{bypass_note}"
+            ));
         }
         None => {
             logs.push(
@@ -1200,9 +1425,10 @@ pub fn launch_antigravity_after_stop(settings: &ProxySettings) -> (bool, Vec<Str
 
 pub fn build_dry_run_preview(settings: &ProxySettings, proxy_port: u16) -> String {
     let proxy_url = format!("http://{}:{}", settings.proxy_host, proxy_port);
+    let (chromium_bypass, env_no_proxy, custom_count) = build_bypass_lists(settings);
     let mut args = vec![
         format!("--proxy-server={proxy_url}"),
-        "--proxy-bypass-list=localhost;127.0.0.1;[::1]".to_string(),
+        format!("--proxy-bypass-list={chromium_bypass}"),
     ];
     if settings.disable_quic {
         args.push("--disable-quic".to_string());
@@ -1211,12 +1437,29 @@ pub fn build_dry_run_preview(settings: &ProxySettings, proxy_port: u16) -> Strin
         args.push(format!("\"{}\"", settings.workspace_path.trim()));
     }
 
+    let bypass_summary = if settings.bypass_china_and_lan {
+        format!(
+            "开启（含 LAN 网段 + .cn + {} 个内置国内常用域名{}）",
+            CHINA_DIRECT_DOMAINS.len(),
+            if custom_count > 0 {
+                format!(" + {custom_count} 条自定义规则")
+            } else {
+                String::new()
+            }
+        )
+    } else if custom_count > 0 {
+        format!("仅自定义（{custom_count} 条规则）")
+    } else {
+        "关闭（仅绕过本机回环地址）".to_string()
+    };
+
     [
         "[DryRun 启动参数预览]".to_string(),
         format!("  目标程序   : {}", settings.antigravity_path),
+        format!("  国内/内网直连: {bypass_summary}"),
         format!("  启动参数   : {}", args.join(" ")),
         format!("  子进程环境 : HTTP_PROXY = HTTPS_PROXY = ALL_PROXY = {proxy_url}"),
-        "  子进程环境 : NO_PROXY = localhost,127.0.0.1,::1,[::1]".to_string(),
+        format!("  子进程环境 : NO_PROXY = {env_no_proxy}"),
         "  子进程环境 : NODE_USE_ENV_PROXY = 1".to_string(),
         "  系统影响   : 不改动 Windows 注册表代理，不改动 Clash Verge 配置，不开 TUN。".to_string(),
     ]
@@ -1303,8 +1546,7 @@ pub fn launch_isolated_antigravity(settings: &ProxySettings, force_restart: bool
     if let Some(dir) = agy_path.parent() {
         cmd.current_dir(dir);
     }
-    cmd.arg(format!("--proxy-server={proxy_url}"));
-    cmd.arg("--proxy-bypass-list=localhost;127.0.0.1;[::1]");
+    apply_proxy_env_and_args(&mut cmd, settings, &proxy_url);
     if settings.disable_quic {
         cmd.arg("--disable-quic");
     }
@@ -1312,27 +1554,18 @@ pub fn launch_isolated_antigravity(settings: &ProxySettings, force_restart: bool
         cmd.arg(settings.workspace_path.trim());
     }
 
-    for key in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
-        cmd.env(key, &proxy_url);
-    }
-    for key in ["NO_PROXY", "no_proxy"] {
-        cmd.env(key, "localhost,127.0.0.1,::1,[::1]");
-    }
-    cmd.env("NODE_USE_ENV_PROXY", "1");
-
     match cmd.spawn() {
         Ok(child) => {
+            let bypass_note = if settings.bypass_china_and_lan {
+                "（已启用国内/内网直连绕过）"
+            } else {
+                ""
+            };
             logs.push(format!(
-                "[OK] Antigravity 已以隔离代理方式启动 (PID {}) -> {}",
+                "[OK] Antigravity 已以隔离代理方式启动 (PID {}) -> {}{}",
                 child.id(),
-                proxy_url
+                proxy_url,
+                bypass_note
             ));
             ActionResponse {
                 ok: true,
@@ -1424,8 +1657,17 @@ where
         .iter()
         .filter(|c| c.category == ConnectionCategory::PublicDirect)
         .count();
+    let ls_direct = cumulative
+        .iter()
+        .filter(|c| {
+            c.category == ConnectionCategory::PublicDirect
+                && c.process_name.to_lowercase().starts_with("language_server")
+        })
+        .count();
+    let bypass_enabled =
+        settings.bypass_china_and_lan || !settings.custom_bypass_domains.trim().is_empty();
 
-    let passed = if tun > 0 || direct > 0 {
+    let passed = if tun > 0 || ls_direct > 0 || (!bypass_enabled && direct > 0) {
         Some(false)
     } else if proxied > 0 {
         Some(true)
@@ -1439,6 +1681,14 @@ where
         format!(
             "  代理端口      : http://{}:{} ({}, Clash 模式: {})",
             settings.proxy_host, latest.resolved_port, latest.port_source, latest.clash_mode
+        ),
+        format!(
+            "  国内/内网直连 : {}",
+            if settings.bypass_china_and_lan {
+                "已开启（命中直连规则的站点不走代理）"
+            } else {
+                "关闭"
+            }
         ),
         format!(
             "  进程数        : Antigravity x{}, language_server x{}",
@@ -1457,6 +1707,12 @@ where
             "  [!] TUN 虚拟网卡开启中: {}",
             latest.tun_adapter_text
         ));
+    }
+    if latest.clash_mode.eq_ignore_ascii_case("global") {
+        lines.push(
+            "  [!] Clash 当前处于 Global 模式，未命中直连列表的国内站点可能走海外节点触发风控，建议切为 Rule 模式。"
+                .to_string(),
+        );
     }
     lines.push(format!("  走代理的连接  : {proxied} 条"));
     lines.push(format!("  TUN 接管连接  : {tun} 条"));
@@ -1479,9 +1735,16 @@ where
         }
     }
     if direct > 0 {
-        lines.push(
-            "  [X] 检测到公网直连，请关闭旧实例后用本面板重新启动 Antigravity。".to_string(),
-        );
+        if bypass_enabled && ls_direct == 0 {
+            lines.push(
+                "  [i] 检测到非 language_server 进程存在公网直连（已开启国内/内网直连绕过，访问国内站点时属正常现象）："
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "  [X] 检测到公网直连，请关闭旧实例后用本面板重新启动 Antigravity。".to_string(),
+            );
+        }
         for item in cumulative
             .iter()
             .filter(|c| c.category == ConnectionCategory::PublicDirect)
@@ -1494,9 +1757,16 @@ where
         }
     }
     if passed == Some(true) {
-        lines.push(
-            "  [OK] 观察期内无 TUN 接管和公网直连，出网连接均落在本地代理端口上。".to_string(),
-        );
+        if bypass_enabled && direct > 0 {
+            lines.push(
+                "  [OK] 核心代理流量均落在本地代理端口，且已按配置允许国内/内网直连绕过。"
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "  [OK] 观察期内无 TUN 接管和公网直连，出网连接均落在本地代理端口上。".to_string(),
+            );
+        }
     } else if passed.is_none() && !cancelled {
         lines.push(
             "  [..] 观察期内应用未产生外部连接（空闲）。请在 Antigravity 中发一条消息后再验收。"
@@ -1561,9 +1831,45 @@ mod tests {
             ConnectionCategory::LocalIpc
         );
         assert_eq!(
+            classify_remote("192.168.1.25", 443, "127.0.0.1", 7897),
+            ConnectionCategory::LocalIpc
+        );
+        assert_eq!(
+            classify_remote("10.0.0.8", 8080, "127.0.0.1", 7897),
+            ConnectionCategory::LocalIpc
+        );
+        assert_eq!(
             classify_remote("142.250.190.78", 443, "127.0.0.1", 7897),
             ConnectionCategory::PublicDirect
         );
+    }
+
+    #[test]
+    fn builds_china_and_custom_bypass_lists_in_dual_formats() {
+        let mut s = ProxySettings::default();
+        s.bypass_china_and_lan = true;
+        s.custom_bypass_domains = "https://www.MyCorp.com/api, 10.20.0.0/16\n*.example.org".to_string();
+        let (chromium, no_proxy, custom_count) = build_bypass_lists(&s);
+        assert_eq!(custom_count, 3);
+        assert!(chromium.contains("*.cn"));
+        assert!(chromium.contains("baidu.com;*.baidu.com"));
+        assert!(chromium.contains("www.mycorp.com;*.www.mycorp.com"));
+        assert!(chromium.contains("example.org;*.example.org"));
+        assert!(chromium.contains("10.20.0.0/16"));
+
+        assert!(no_proxy.contains(".cn"));
+        assert!(no_proxy.contains(".baidu.com"));
+        assert!(no_proxy.contains(".www.mycorp.com"));
+        assert!(no_proxy.contains(".example.org"));
+        assert!(no_proxy.contains("10.20.0.0/16"));
+        assert!(!no_proxy.contains('*'), "NO_PROXY must not contain * wildcards");
+
+        s.bypass_china_and_lan = false;
+        s.custom_bypass_domains = String::new();
+        let (chromium_off, no_proxy_off, count_off) = build_bypass_lists(&s);
+        assert_eq!(count_off, 0);
+        assert!(!chromium_off.contains("*.cn"));
+        assert!(!no_proxy_off.contains(".cn"));
     }
 
     #[test]
@@ -1579,6 +1885,7 @@ mod tests {
         let s = ProxySettings::default();
         let preview = build_dry_run_preview(&s, 7897);
         assert!(preview.contains("--proxy-server=http://127.0.0.1:7897"));
+        assert!(preview.contains("*.cn"));
         assert!(preview.contains("NODE_USE_ENV_PROXY = 1"));
     }
 }

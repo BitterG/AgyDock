@@ -30,6 +30,7 @@ export function initProxyModule() {
     refreshBtn: document.getElementById('proxyRefreshBtn'),
 
     warnBanner: document.getElementById('proxyWarnBanner'),
+    globalWarnBanner: document.getElementById('proxyGlobalWarnBanner'),
     confirmBanner: document.getElementById('proxyConfirmBanner'),
     confirmText: document.getElementById('proxyConfirmText'),
     confirmOkBtn: document.getElementById('proxyConfirmOkBtn'),
@@ -53,6 +54,9 @@ export function initProxyModule() {
     inputHost: document.getElementById('proxyInputHost'),
     chkAutoPort: document.getElementById('proxyChkAutoPort'),
     inputPort: document.getElementById('proxyInputPort'),
+    chkBypassChina: document.getElementById('proxyChkBypassChina'),
+    inputCustomBypass: document.getElementById('proxyInputCustomBypass'),
+    btnClearBypass: document.getElementById('proxyBtnClearBypass'),
     chkAutoClash: document.getElementById('proxyChkAutoClash'),
     chkDisableQuic: document.getElementById('proxyChkDisableQuic'),
     chkAutoRefresh: document.getElementById('proxyChkAutoRefresh'),
@@ -200,6 +204,17 @@ export function initProxyModule() {
     const direct = overrideCounts ? overrideCounts.direct : snap.directCount;
     const totalProcs = (snap.antigravityProcCount || 0) + (snap.languageServerProcCount || 0);
 
+    const bypassEnabled = Boolean(
+      state.settings?.bypassChinaAndLan || state.settings?.customBypassDomains?.trim()
+    );
+    const lsDirect = state.displayedConnections.some(
+      (c) =>
+        c.category === 'publicDirect' &&
+        String(c.processName || '')
+          .toLowerCase()
+          .startsWith('language_server')
+    );
+
     // Status headline & dot
     els.statusDot.className = 'status-dot';
     if (!snap.isProxyListening) {
@@ -208,12 +223,14 @@ export function initProxyModule() {
     } else if (totalProcs === 0) {
       els.statusDot.classList.add('muted');
       els.headline.textContent = 'Antigravity 未运行';
-    } else if (direct > 0) {
+    } else if (lsDirect || (!bypassEnabled && direct > 0)) {
       els.statusDot.classList.add('err');
       els.headline.textContent = '检测到公网直连';
     } else if (tun > 0) {
       els.statusDot.classList.add('warn');
       els.headline.textContent = '由 TUN 网卡接管';
+    } else if (proxied > 0 && direct > 0 && bypassEnabled) {
+      els.headline.textContent = '隔离代理运行中 (含直连绕过)';
     } else if (proxied > 0) {
       els.headline.textContent = '隔离代理运行中';
     } else {
@@ -221,7 +238,8 @@ export function initProxyModule() {
     }
 
     const modeSuffix = snap.clashMode && snap.clashMode !== '未知' ? ` (${snap.clashMode})` : '';
-    els.headlineSub.textContent = `${snap.proxyHost}:${snap.resolvedPort}${modeSuffix} · ${snap.portSource}`;
+    const bypassTag = bypassEnabled ? ' · 国内直连' : '';
+    els.headlineSub.textContent = `${snap.proxyHost}:${snap.resolvedPort}${modeSuffix}${bypassTag} · ${snap.portSource}`;
 
     els.launchBtn.textContent = totalProcs > 0 ? '重启 Antigravity' : '启动 Antigravity';
 
@@ -238,6 +256,10 @@ export function initProxyModule() {
     }
 
     els.warnBanner.classList.toggle('hidden', !(snap.systemProxyEnabled || snap.tunEnabled));
+    if (els.globalWarnBanner) {
+      const isGlobalMode = String(snap.clashMode || '').trim().toLowerCase() === 'global';
+      els.globalWarnBanner.classList.toggle('hidden', !isGlobalMode);
+    }
 
     // Process cell
     els.procValue.textContent = `${totalProcs} 进程`;
@@ -262,6 +284,8 @@ export function initProxyModule() {
     els.chkAutoPort.checked = Boolean(s.autoDetectPort);
     els.inputPort.value = String(s.customPort || 7897);
     els.inputPort.disabled = Boolean(s.autoDetectPort);
+    if (els.chkBypassChina) els.chkBypassChina.checked = s.bypassChinaAndLan !== false;
+    if (els.inputCustomBypass) els.inputCustomBypass.value = s.customBypassDomains || '';
     els.chkAutoClash.checked = Boolean(s.autoStartClash);
     els.chkDisableQuic.checked = Boolean(s.disableQuic);
     els.chkShowIpc.checked = Boolean(s.showLoopbackIpc);
@@ -282,6 +306,8 @@ export function initProxyModule() {
       autoStartClash: Boolean(els.chkAutoClash.checked),
       disableQuic: Boolean(els.chkDisableQuic.checked),
       showLoopbackIpc: Boolean(els.chkShowIpc.checked),
+      bypassChinaAndLan: els.chkBypassChina ? Boolean(els.chkBypassChina.checked) : true,
+      customBypassDomains: els.inputCustomBypass ? els.inputCustomBypass.value.trim() : '',
     };
   }
 
@@ -452,12 +478,25 @@ export function initProxyModule() {
     else stopAutoRefresh();
   });
 
-  [els.inputHost, els.inputPort, els.inputAgyPath, els.inputClashPath, els.inputWorkspace].forEach(
-    (input) => input.addEventListener('input', () => persistSettings(false))
-  );
-  [els.chkAutoClash, els.chkDisableQuic].forEach((chk) =>
-    chk.addEventListener('change', () => persistSettings(false))
-  );
+  [
+    els.inputHost,
+    els.inputPort,
+    els.inputAgyPath,
+    els.inputClashPath,
+    els.inputWorkspace,
+    els.inputCustomBypass,
+  ]
+    .filter(Boolean)
+    .forEach((input) => input.addEventListener('input', () => persistSettings(false)));
+  [els.chkAutoClash, els.chkDisableQuic, els.chkBypassChina]
+    .filter(Boolean)
+    .forEach((chk) => chk.addEventListener('change', () => persistSettings(false)));
+  if (els.btnClearBypass) {
+    els.btnClearBypass.addEventListener('click', async () => {
+      els.inputCustomBypass.value = '';
+      await persistSettings(true);
+    });
+  }
 
   async function browseField(kind, inputEl) {
     if (!tauriInvoke) return;

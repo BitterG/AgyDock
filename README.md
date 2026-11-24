@@ -16,6 +16,7 @@
   - 顶栏一键切换 **用量看板 / 隔离代理** 双模块，完全免去 `.NET 8 Desktop Runtime` 依赖；
   - **隔离代理模块**（原生 Win32 API 实现，完整移植自 `AntigravityTunPanel`）：
     - 仅让 Antigravity 及其 `language_server` 子进程走本地代理（`--proxy-server` + `HTTP_PROXY/HTTPS_PROXY/NODE_USE_ENV_PROXY=1`），不开 TUN、不改系统代理；
+    - **国内/内网直连绕过（防风控）**：默认自动绕过 `.cn`、国内常用站点/云服务/镜像与局域网私网段（同步生成 Chromium `--proxy-bypass-list` 与 `NO_PROXY`），并支持自定义直连域名与 Clash Global 模式告警，避免从 Antigravity 访问国内站点走海外节点触发风控；
     - 自动读取 Clash Verge 配置与端口探测、启动时自动拉起 Clash Verge、只读检测 Windows 系统代理与 TUN 虚拟网卡；
     - 基于 Win32 `GetExtendedTcpTable` 实时扫描 TCP 连接明细（区分 `走代理`、`TUN Fake-IP`、`公网直连`、`本地 IPC`）；
     - 支持「验收 20s」累计检查并生成验收报告、刷新 DNS、启动参数预览、结束进程与可折叠路径配置；
