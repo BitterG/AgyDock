@@ -3,13 +3,14 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -100,6 +101,198 @@ fn default_true() -> bool {
     true
 }
 
+pub fn cli_shim_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("AgyDock")
+        .join("cli-shim")
+}
+
+pub fn normalize_path_key(p: &str) -> String {
+    let replaced = p.trim().replace('/', "\\");
+    let trimmed = replaced.trim_end_matches('\\');
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        format!("{}\\", trimmed.to_lowercase())
+    } else {
+        trimmed.to_lowercase()
+    }
+}
+
+pub fn is_inside_dir(path: &Path, dir: &Path) -> bool {
+    let p = normalize_path_key(&path.to_string_lossy());
+    let d = normalize_path_key(&dir.to_string_lossy());
+    if d.is_empty() || p.is_empty() {
+        return false;
+    }
+    if p == d {
+        return true;
+    }
+    if d.ends_with('\\') {
+        p.starts_with(&d)
+    } else {
+        p.starts_with(&format!("{d}\\"))
+    }
+}
+
+fn push_unique_cli_candidate(
+    candidates: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    path: &Path,
+    shim_dir: &Path,
+) {
+    if is_inside_dir(path, shim_dir) || !path.is_file() {
+        return;
+    }
+    let raw = path.to_string_lossy().to_string();
+    let key = normalize_path_key(&raw);
+    if !key.is_empty() && seen.insert(key) {
+        candidates.push(raw);
+    }
+}
+
+pub fn detect_cli_candidates() -> Vec<String> {
+    let shim_dir = cli_shim_dir();
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            push_unique_cli_candidate(&mut candidates, &mut seen, &dir.join("agy.exe"), &shim_dir);
+            push_unique_cli_candidate(
+                &mut candidates,
+                &mut seen,
+                &dir.join("antigravity-cli.exe"),
+                &shim_dir,
+            );
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        push_unique_cli_candidate(
+            &mut candidates,
+            &mut seen,
+            &home.join(".local").join("bin").join("agy.exe"),
+            &shim_dir,
+        );
+        push_unique_cli_candidate(
+            &mut candidates,
+            &mut seen,
+            &home.join(".antigravity").join("bin").join("agy.exe"),
+            &shim_dir,
+        );
+    }
+
+    if let Some(local_app) = dirs::data_local_dir() {
+        push_unique_cli_candidate(
+            &mut candidates,
+            &mut seen,
+            &local_app
+                .join("Programs")
+                .join("antigravity-cli")
+                .join("agy.exe"),
+            &shim_dir,
+        );
+        push_unique_cli_candidate(
+            &mut candidates,
+            &mut seen,
+            &local_app.join("antigravity").join("agy.exe"),
+            &shim_dir,
+        );
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let t3_acp_root = home
+            .join(".t3")
+            .join("tools")
+            .join("antigravity-acp")
+            .join("win32-x64");
+        let active_json = t3_acp_root.join("active.json");
+        if let Ok(raw) = fs::read_to_string(&active_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(rel_id) = val.get("releaseId").and_then(|v| v.as_str()) {
+                    let rel_id = rel_id.trim();
+                    if !rel_id.is_empty() {
+                        push_unique_cli_candidate(
+                            &mut candidates,
+                            &mut seen,
+                            &t3_acp_root.join("versions").join(rel_id).join("agy.exe"),
+                            &shim_dir,
+                        );
+                    }
+                }
+            }
+        }
+
+        let versions_dir = t3_acp_root.join("versions");
+        if let Ok(entries) = fs::read_dir(&versions_dir) {
+            let mut versioned: Vec<(SystemTime, PathBuf)> = Vec::new();
+            for entry in entries.flatten() {
+                let exe = entry.path().join("agy.exe");
+                if exe.is_file() {
+                    let mtime = fs::metadata(&exe)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    versioned.push((mtime, exe));
+                }
+            }
+            versioned.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, exe) in versioned {
+                push_unique_cli_candidate(&mut candidates, &mut seen, &exe, &shim_dir);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn default_cli_path() -> String {
+    detect_cli_candidates().into_iter().next().unwrap_or_default()
+}
+
+pub fn detect_default_cli_tools() -> Vec<CliToolEntry> {
+    let mut tools = Vec::new();
+    let mut t3_candidates: Vec<PathBuf> = Vec::new();
+    if let Some(local_app) = dirs::data_local_dir() {
+        t3_candidates.push(
+            local_app
+                .join("Programs")
+                .join("t3code")
+                .join("T3 Code (Beta).exe"),
+        );
+        t3_candidates.push(local_app.join("Programs").join("t3code").join("T3 Code.exe"));
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        t3_candidates.push(PathBuf::from(&pf).join("T3 Code").join("T3 Code.exe"));
+        t3_candidates.push(PathBuf::from(&pf).join("T3 Code").join("T3 Code (Beta).exe"));
+    }
+
+    if let Some(exe) = t3_candidates.into_iter().find(|p| p.is_file()) {
+        tools.push(CliToolEntry {
+            id: "t3-code".to_string(),
+            name: "T3 Code".to_string(),
+            exe_path: exe.to_string_lossy().to_string(),
+            args: String::new(),
+            working_dir: String::new(),
+            is_chromium: true,
+            monitor: true,
+        });
+    }
+
+    tools
+}
+
+pub fn detect_cli_and_tools() -> CliDetectResult {
+    let cli_candidates = detect_cli_candidates();
+    let cli_path = cli_candidates.first().cloned().unwrap_or_default();
+    let detected_tools = detect_default_cli_tools();
+    CliDetectResult {
+        cli_path,
+        cli_candidates,
+        detected_tools,
+    }
+}
+
 /// 内置国内常用域名后缀（不含 .cn，.cn 已单独通配），用于在启用「国内/内网直连绕过」时
 /// 避免访问国内站点走海外代理节点触发风控。
 const CHINA_DIRECT_DOMAINS: &[&str] = &[
@@ -177,6 +370,45 @@ const LAN_BYPASS_CIDRS: &[&str] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CliToolEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub exe_path: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default)]
+    pub working_dir: String,
+    #[serde(default = "default_true")]
+    pub is_chromium: bool,
+    #[serde(default = "default_true")]
+    pub monitor: bool,
+}
+
+fn slugify_tool_id(raw: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "tool".to_string()
+    } else {
+        trimmed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProxySettings {
     pub proxy_host: String,
     pub auto_detect_port: bool,
@@ -191,6 +423,12 @@ pub struct ProxySettings {
     pub bypass_china_and_lan: bool,
     #[serde(default)]
     pub custom_bypass_domains: String,
+    #[serde(default)]
+    pub cli_path: String,
+    #[serde(default)]
+    pub cli_tools: Vec<CliToolEntry>,
+    #[serde(default)]
+    pub cli_tools_initialized: bool,
 }
 
 impl Default for ProxySettings {
@@ -207,6 +445,9 @@ impl Default for ProxySettings {
             show_loopback_ipc: false,
             bypass_china_and_lan: true,
             custom_bypass_domains: String::new(),
+            cli_path: default_cli_path(),
+            cli_tools: Vec::new(),
+            cli_tools_initialized: false,
         }
     }
 }
@@ -233,6 +474,55 @@ impl ProxySettings {
         }
         self.workspace_path = self.workspace_path.trim().to_string();
         self.custom_bypass_domains = self.custom_bypass_domains.trim().to_string();
+
+        if self.cli_path.trim().is_empty() {
+            self.cli_path = default_cli_path();
+        } else {
+            self.cli_path = self.cli_path.trim().to_string();
+        }
+
+        let mut cleaned_tools = Vec::new();
+        let mut used_ids = HashSet::new();
+        for mut tool in self.cli_tools {
+            tool.exe_path = tool.exe_path.trim().to_string();
+            if tool.exe_path.is_empty() {
+                continue;
+            }
+            tool.name = tool.name.trim().to_string();
+            tool.args = tool.args.trim().to_string();
+            tool.working_dir = tool.working_dir.trim().to_string();
+            let stem = Path::new(&tool.exe_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("tool")
+                .to_string();
+            if tool.name.is_empty() {
+                tool.name = stem.clone();
+            }
+            let base_id = if tool.id.trim().is_empty() {
+                slugify_tool_id(&tool.name)
+            } else {
+                slugify_tool_id(tool.id.trim())
+            };
+            let mut candidate_id = base_id.clone();
+            let mut suffix = 2usize;
+            while !used_ids.insert(candidate_id.clone()) {
+                candidate_id = format!("{base_id}-{suffix}");
+                suffix += 1;
+            }
+            tool.id = candidate_id;
+            cleaned_tools.push(tool);
+        }
+        self.cli_tools = cleaned_tools;
+
+        if !self.cli_tools_initialized && self.cli_tools.is_empty() {
+            self.cli_tools = detect_default_cli_tools();
+            self.cli_tools_initialized = true;
+        } else if !self.cli_tools.is_empty() {
+            self.cli_tools_initialized = true;
+        }
         self
     }
 
@@ -262,6 +552,36 @@ impl ProxySettings {
             let _ = fs::write(p, json);
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliShimStatus {
+    pub enabled: bool,
+    pub in_user_path: bool,
+    pub shim_dir: String,
+    pub target_exe: String,
+    pub proxy_url: String,
+    pub out_of_sync: bool,
+    pub cli_detected: bool,
+    pub cli_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliDetectResult {
+    pub cli_path: String,
+    pub cli_candidates: Vec<String>,
+    pub detected_tools: Vec<CliToolEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliShellSnippets {
+    pub proxy_url: String,
+    pub powershell: String,
+    pub cmd: String,
+    pub bash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -314,6 +634,9 @@ pub struct TcpConnectionItem {
 pub struct ProcessEntry {
     pub pid: u32,
     pub name: String,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,6 +654,10 @@ pub struct ProxySnapshot {
     pub tun_adapter_text: String,
     pub antigravity_proc_count: usize,
     pub language_server_proc_count: usize,
+    pub cli_proc_count: usize,
+    pub tool_proc_count: usize,
+    pub tool_running_counts: HashMap<String, usize>,
+    pub cli_shim: CliShimStatus,
     pub processes: Vec<ProcessEntry>,
     pub proxied_count: usize,
     pub tun_count: usize,
@@ -609,12 +936,16 @@ struct RawTcpSocket {
 #[cfg(windows)]
 mod win_native {
     use super::*;
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR};
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE,
+        NO_ERROR,
+    };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GetExtendedTcpTable, GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES_LH,
-        MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+        GetAdaptersAddresses, GetExtendedTcpTable, GAA_FLAG_INCLUDE_PREFIX,
+        IP_ADAPTER_ADDRESSES_LH, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
+        TCP_TABLE_OWNER_PID_ALL,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
@@ -626,11 +957,27 @@ mod win_native {
         OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
+    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use winreg::{RegKey, RegValue};
 
     const MIB_TCP_STATE_SYN_SENT: u32 = 3;
     const MIB_TCP_STATE_ESTAB: u32 = 5;
+    const HWND_BROADCAST: isize = 0xFFFF;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: isize,
+            msg: u32,
+            wparam: usize,
+            lparam: *const u16,
+            flags: u32,
+            timeout: u32,
+            lpdw_result: *mut usize,
+        ) -> isize;
+    }
 
     pub fn get_system_proxy_state() -> (bool, String) {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -641,6 +988,72 @@ mod win_native {
         let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 1;
         let server = key.get_value::<String, _>("ProxyServer").unwrap_or_default();
         (enabled, server)
+    }
+
+    pub fn read_user_path() -> Result<(String, bool), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key = hkcu
+            .open_subkey_with_flags("Environment", KEY_READ)
+            .map_err(|e| format!("无法读取 HKCU\\Environment: {e}"))?;
+        match key.get_raw_value("Path") {
+            Ok(val) => {
+                let is_expand_sz = !matches!(val.vtype, RegType::REG_SZ);
+                let mut u16s: Vec<u16> = val
+                    .bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                while u16s.last() == Some(&0) {
+                    u16s.pop();
+                }
+                Ok((String::from_utf16_lossy(&u16s), is_expand_sz))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((String::new(), true)),
+            Err(err) => Err(format!("读取用户 PATH 失败: {err}")),
+        }
+    }
+
+    pub fn write_user_path(value: &str, is_expand_sz: bool) -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .map_err(|e| format!("无法打开 HKCU\\Environment 写入权限: {e}"))?;
+        let wide: Vec<u16> = OsStr::new(value).encode_wide().chain(Some(0)).collect();
+        let mut bytes = Vec::with_capacity(wide.len() * 2);
+        for w in wide {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let reg_val = RegValue {
+            vtype: if is_expand_sz {
+                RegType::REG_EXPAND_SZ
+            } else {
+                RegType::REG_SZ
+            },
+            bytes: bytes.into(),
+        };
+        key.set_raw_value("Path", &reg_val)
+            .map_err(|e| format!("写入用户 PATH 失败: {e}"))?;
+        broadcast_environment_change();
+        Ok(())
+    }
+
+    fn broadcast_environment_change() {
+        let env_wide: Vec<u16> = OsStr::new("Environment")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut result: usize = 0;
+        unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                env_wide.as_ptr(),
+                SMTO_ABORTIFHUNG,
+                1000,
+                &mut result,
+            );
+        }
     }
 
     unsafe fn pwstr_to_string(ptr: *const u16) -> String {
@@ -724,23 +1137,24 @@ mod win_native {
         )
     }
 
-    pub fn scan_antigravity_and_clash(antigravity_path: &str) -> (Vec<ProcessEntry>, bool) {
-        let install_dir = Path::new(antigravity_path.trim())
-            .parent()
-            .map(|p| p.to_string_lossy().to_lowercase())
-            .filter(|s| !s.is_empty());
+    #[derive(Debug, Clone)]
+    struct RawProcessInfo {
+        pid: u32,
+        parent_pid: u32,
+        stem: String,
+        stem_lower: String,
+    }
 
+    fn collect_process_snapshot() -> Vec<RawProcessInfo> {
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
-            return (Vec::new(), false);
+            return Vec::new();
         }
 
         let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-        let mut procs = Vec::new();
-        let mut clash_running = false;
-
+        let mut list = Vec::new();
         let mut has_next = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
         while has_next {
             let nul_pos = entry
@@ -754,40 +1168,289 @@ mod win_native {
             let stem = exe_name
                 .strip_suffix(".exe")
                 .or_else(|| exe_name.strip_suffix(".EXE"))
-                .unwrap_or(&exe_name);
+                .unwrap_or(&exe_name)
+                .to_string();
             let stem_lower = stem.to_lowercase();
+            list.push(RawProcessInfo {
+                pid: entry.th32ProcessID,
+                parent_pid: entry.th32ParentProcessID,
+                stem,
+                stem_lower,
+            });
+            has_next = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
 
-            if stem_lower.contains("clash-verge") || stem_lower.contains("verge-mihomo") {
+        unsafe { CloseHandle(snapshot) };
+        list
+    }
+
+    fn is_antigravity_app_stem(stem_lower: &str) -> bool {
+        stem_lower.starts_with("antigravity")
+            && stem_lower != "uninstall antigravity"
+            && stem_lower != "agydock"
+            && stem_lower != "antigravityusage"
+            && stem_lower != "antigravity-usage-desktop"
+            && stem_lower != "antigravitytunpanel"
+            && stem_lower != "antigravity-cli"
+    }
+
+    fn is_cli_stem(stem_lower: &str) -> bool {
+        stem_lower == "agy" || stem_lower == "antigravity-cli"
+    }
+
+    pub fn scan_antigravity_and_clash(antigravity_path: &str) -> (Vec<ProcessEntry>, bool) {
+        let install_dir = Path::new(antigravity_path.trim())
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty());
+
+        let snapshot = collect_process_snapshot();
+        let mut procs = Vec::new();
+        let mut clash_running = false;
+
+        for p in snapshot {
+            if p.stem_lower.contains("clash-verge") || p.stem_lower.contains("verge-mihomo") {
                 clash_running = true;
             }
 
-            let is_target_name = (stem_lower.starts_with("antigravity")
-                || stem_lower.starts_with("language_server"))
-                && stem_lower != "uninstall antigravity"
-                && stem_lower != "agydock"
-                && stem_lower != "antigravityusage"
-                && stem_lower != "antigravity-usage-desktop"
-                && stem_lower != "antigravitytunpanel";
-
-            if is_target_name {
-                if let Some(ref dir_lower) = install_dir {
-                    if let Some(full_path) = query_process_image_path(entry.th32ProcessID) {
-                        if full_path.to_lowercase().starts_with(dir_lower) {
+            let is_ls = p.stem_lower.starts_with("language_server");
+            let is_agy = is_antigravity_app_stem(&p.stem_lower);
+            if is_agy || is_ls {
+                if let Some(dir) = install_dir {
+                    if let Some(full_path) = query_process_image_path(p.pid) {
+                        if is_inside_dir(Path::new(&full_path), dir) {
                             procs.push(ProcessEntry {
-                                pid: entry.th32ProcessID,
-                                name: stem.to_string(),
+                                pid: p.pid,
+                                name: p.stem,
+                                role: if is_ls {
+                                    "language_server".to_string()
+                                } else {
+                                    "antigravity".to_string()
+                                },
+                                tool_id: None,
                             });
                         }
                     }
                 }
             }
-
-            has_next = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
 
-        unsafe { CloseHandle(snapshot) };
         procs.sort_by_key(|p| p.pid);
         (procs, clash_running)
+    }
+
+    pub fn scan_all_tracked_processes(
+        settings: &ProxySettings,
+    ) -> (Vec<ProcessEntry>, HashMap<String, usize>, bool) {
+        let install_dir = Path::new(settings.antigravity_path.trim())
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty());
+
+        let mut tool_by_stem: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for tool in &settings.cli_tools {
+            if !tool.monitor {
+                continue;
+            }
+            let exe_norm = normalize_path_key(&tool.exe_path);
+            if exe_norm.is_empty() {
+                continue;
+            }
+            let stem_lower = Path::new(tool.exe_path.trim())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if stem_lower.is_empty() {
+                continue;
+            }
+            tool_by_stem
+                .entry(stem_lower)
+                .or_default()
+                .push((tool.id.clone(), exe_norm));
+        }
+
+        let snapshot = collect_process_snapshot();
+        let mut procs = Vec::new();
+        let mut tool_counts: HashMap<String, usize> = HashMap::new();
+        let mut clash_running = false;
+
+        for p in snapshot {
+            if p.stem_lower.contains("clash-verge") || p.stem_lower.contains("verge-mihomo") {
+                clash_running = true;
+            }
+
+            if is_cli_stem(&p.stem_lower) {
+                procs.push(ProcessEntry {
+                    pid: p.pid,
+                    name: p.stem,
+                    role: "cli".to_string(),
+                    tool_id: None,
+                });
+                continue;
+            }
+
+            let is_ls = p.stem_lower.starts_with("language_server");
+            let is_agy = is_antigravity_app_stem(&p.stem_lower);
+            if is_agy || is_ls {
+                if let Some(dir) = install_dir {
+                    if let Some(full_path) = query_process_image_path(p.pid) {
+                        if is_inside_dir(Path::new(&full_path), dir) {
+                            procs.push(ProcessEntry {
+                                pid: p.pid,
+                                name: p.stem,
+                                role: if is_ls {
+                                    "language_server".to_string()
+                                } else {
+                                    "antigravity".to_string()
+                                },
+                                tool_id: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if let Some(candidates) = tool_by_stem.get(&p.stem_lower) {
+                if let Some(full_path) = query_process_image_path(p.pid) {
+                    let full_norm = normalize_path_key(&full_path);
+                    if let Some((tool_id, _)) =
+                        candidates.iter().find(|(_, exe_norm)| *exe_norm == full_norm)
+                    {
+                        *tool_counts.entry(tool_id.clone()).or_insert(0) += 1;
+                        procs.push(ProcessEntry {
+                            pid: p.pid,
+                            name: p.stem,
+                            role: "tool".to_string(),
+                            tool_id: Some(tool_id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+
+        procs.sort_by_key(|p| p.pid);
+        (procs, tool_counts, clash_running)
+    }
+
+    pub fn scan_cli_processes() -> Vec<ProcessEntry> {
+        let mut procs: Vec<ProcessEntry> = collect_process_snapshot()
+            .into_iter()
+            .filter(|p| is_cli_stem(&p.stem_lower))
+            .map(|p| ProcessEntry {
+                pid: p.pid,
+                name: p.stem,
+                role: "cli".to_string(),
+                tool_id: None,
+            })
+            .collect();
+        procs.sort_by_key(|p| p.pid);
+        procs
+    }
+
+    fn is_generic_bin_dir(dir: &Path) -> bool {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            return true;
+        };
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "bin"
+                | "scripts"
+                | "system32"
+                | "syswow64"
+                | "windows"
+                | "tools"
+                | "shims"
+                | "cli-shim"
+                | "programs"
+                | "local"
+                | "roaming"
+                | "appdata"
+                | "users"
+        )
+    }
+
+    pub fn scan_tool_process_tree(exe_path: &str) -> Vec<ProcessEntry> {
+        let target_norm = normalize_path_key(exe_path);
+        if target_norm.is_empty() {
+            return Vec::new();
+        }
+        let target_path = Path::new(exe_path.trim());
+        let target_stem_lower = target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if target_stem_lower.is_empty() {
+            return Vec::new();
+        }
+        let target_parent = target_path.parent().filter(|p| !p.as_os_str().is_empty());
+        let allow_dir_children = target_parent.map(|d| !is_generic_bin_dir(d)).unwrap_or(false);
+
+        let snapshot = collect_process_snapshot();
+        let mut matched_pids = HashSet::new();
+        let mut procs = Vec::new();
+
+        for p in &snapshot {
+            if p.stem_lower == target_stem_lower {
+                if let Some(full_path) = query_process_image_path(p.pid) {
+                    if normalize_path_key(&full_path) == target_norm && matched_pids.insert(p.pid) {
+                        procs.push(ProcessEntry {
+                            pid: p.pid,
+                            name: p.stem.clone(),
+                            role: "tool".to_string(),
+                            tool_id: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        if matched_pids.is_empty() {
+            return procs;
+        }
+
+        loop {
+            let mut added = false;
+            for p in &snapshot {
+                if matched_pids.contains(&p.pid) || !matched_pids.contains(&p.parent_pid) {
+                    continue;
+                }
+                let is_cli = is_cli_stem(&p.stem_lower);
+                let is_ls = p.stem_lower.starts_with("language_server");
+                let same_stem = p.stem_lower == target_stem_lower;
+                let inside_tool_dir = if !same_stem && !is_cli && !is_ls && allow_dir_children {
+                    target_parent
+                        .zip(query_process_image_path(p.pid))
+                        .map(|(dir, fp)| is_inside_dir(Path::new(&fp), dir))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if same_stem || is_cli || is_ls || inside_tool_dir {
+                    matched_pids.insert(p.pid);
+                    procs.push(ProcessEntry {
+                        pid: p.pid,
+                        name: p.stem.clone(),
+                        role: if is_cli {
+                            "cli".to_string()
+                        } else if is_ls {
+                            "language_server".to_string()
+                        } else {
+                            "tool".to_string()
+                        },
+                        tool_id: None,
+                    });
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        procs.sort_by_key(|p| p.pid);
+        procs
     }
 
     pub fn terminate_pid(pid: u32) -> Result<(), String> {
@@ -952,11 +1615,28 @@ mod win_native {
     pub fn get_system_proxy_state() -> (bool, String) {
         (false, String::new())
     }
+    pub fn read_user_path() -> Result<(String, bool), String> {
+        Ok((String::new(), true))
+    }
+    pub fn write_user_path(_value: &str, _is_expand_sz: bool) -> Result<(), String> {
+        Err("仅支持 Windows".to_string())
+    }
     pub fn get_tun_adapter_state() -> (bool, String) {
         (false, String::new())
     }
     pub fn scan_antigravity_and_clash(_antigravity_path: &str) -> (Vec<ProcessEntry>, bool) {
         (Vec::new(), false)
+    }
+    pub fn scan_all_tracked_processes(
+        _settings: &ProxySettings,
+    ) -> (Vec<ProcessEntry>, HashMap<String, usize>, bool) {
+        (Vec::new(), HashMap::new(), false)
+    }
+    pub fn scan_cli_processes() -> Vec<ProcessEntry> {
+        Vec::new()
+    }
+    pub fn scan_tool_process_tree(_exe_path: &str) -> Vec<ProcessEntry> {
+        Vec::new()
     }
     pub fn terminate_pid(_pid: u32) -> Result<(), String> {
         Err("仅支持 Windows".to_string())
@@ -970,20 +1650,23 @@ pub fn build_snapshot(settings: &ProxySettings) -> ProxySnapshot {
     let (resolved_port, port_source, is_listening, clash_mode) = resolve_port(settings);
     let (sys_proxy_enabled, sys_proxy_server) = win_native::get_system_proxy_state();
     let (tun_enabled, tun_adapter_text) = win_native::get_tun_adapter_state();
-    let (procs, clash_running) = win_native::scan_antigravity_and_clash(&settings.antigravity_path);
+    let (procs, tool_running_counts, clash_running) = win_native::scan_all_tracked_processes(settings);
 
     let mut pid_map: HashMap<u32, String> = HashMap::new();
     let mut pid_set: HashSet<u32> = HashSet::new();
     let mut agy_count = 0usize;
     let mut ls_count = 0usize;
+    let mut cli_count = 0usize;
+    let mut tool_count = 0usize;
 
     for p in &procs {
         pid_map.insert(p.pid, p.name.clone());
         pid_set.insert(p.pid);
-        if p.name.to_lowercase().starts_with("language_server") {
-            ls_count += 1;
-        } else {
-            agy_count += 1;
+        match p.role.as_str() {
+            "language_server" => ls_count += 1,
+            "cli" => cli_count += 1,
+            "tool" => tool_count += 1,
+            _ => agy_count += 1,
         }
     }
 
@@ -1046,6 +1729,7 @@ pub fn build_snapshot(settings: &ProxySettings) -> ProxySnapshot {
         .iter()
         .filter(|c| c.category == ConnectionCategory::PublicDirect)
         .count();
+    let cli_shim = get_cli_shim_status(settings, resolved_port);
 
     ProxySnapshot {
         proxy_host: settings.proxy_host.clone(),
@@ -1060,6 +1744,10 @@ pub fn build_snapshot(settings: &ProxySettings) -> ProxySnapshot {
         tun_adapter_text,
         antigravity_proc_count: agy_count,
         language_server_proc_count: ls_count,
+        cli_proc_count: cli_count,
+        tool_proc_count: tool_count,
+        tool_running_counts,
+        cli_shim,
         processes: procs,
         proxied_count,
         tun_count,
@@ -1160,18 +1848,23 @@ pub fn flush_dns_cache() -> Vec<String> {
     logs
 }
 
-pub fn stop_antigravity_processes(antigravity_path: &str) -> (bool, Vec<String>) {
+fn stop_processes_with<F>(
+    mut scan: F,
+    empty_msg: &str,
+    closing_label: &str,
+    done_msg: &str,
+) -> (bool, Vec<String>)
+where
+    F: FnMut() -> Vec<ProcessEntry>,
+{
     let mut logs = Vec::new();
-    let (procs, _) = win_native::scan_antigravity_and_clash(antigravity_path);
+    let procs = scan();
     if procs.is_empty() {
-        logs.push("[i] 当前没有正在运行的 Antigravity 进程。".to_string());
+        logs.push(empty_msg.to_string());
         return (true, logs);
     }
 
-    logs.push(format!(
-        "[..] 正在关闭 {} 个 Antigravity 相关进程...",
-        procs.len()
-    ));
+    logs.push(format!("[..] 正在关闭 {} 个{closing_label}...", procs.len()));
     for p in &procs {
         if let Err(err) = win_native::terminate_pid(p.pid) {
             logs.push(format!("    忽略关闭 {}(PID {}): {err}", p.name, p.pid));
@@ -1180,16 +1873,43 @@ pub fn stop_antigravity_processes(antigravity_path: &str) -> (bool, Vec<String>)
 
     for _ in 0..16 {
         thread::sleep(Duration::from_millis(300));
-        let (rem, _) = win_native::scan_antigravity_and_clash(antigravity_path);
+        let rem = scan();
         if rem.is_empty() {
-            logs.push("[OK] 所有旧 Antigravity 进程已退出。".to_string());
+            logs.push(done_msg.to_string());
             return (true, logs);
         }
     }
 
-    let (remaining, _) = win_native::scan_antigravity_and_clash(antigravity_path);
+    let remaining = scan();
     logs.push(format!("[!] 仍有 {} 个进程未完全退出。", remaining.len()));
     (remaining.is_empty(), logs)
+}
+
+pub fn stop_antigravity_processes(antigravity_path: &str) -> (bool, Vec<String>) {
+    stop_processes_with(
+        || win_native::scan_antigravity_and_clash(antigravity_path).0,
+        "[i] 当前没有正在运行的 Antigravity 进程。",
+        " Antigravity 相关进程",
+        "[OK] 所有旧 Antigravity 进程已退出。",
+    )
+}
+
+pub fn stop_cli_tool_processes(exe_path: &str, tool_name: &str) -> (bool, Vec<String>) {
+    stop_processes_with(
+        || win_native::scan_tool_process_tree(exe_path),
+        &format!("[i] 当前没有正在运行的 {tool_name} 进程。"),
+        &format!(" {tool_name} 相关进程"),
+        &format!("[OK] 所有旧 {tool_name} 相关进程已退出。"),
+    )
+}
+
+pub fn stop_cli_processes() -> (bool, Vec<String>) {
+    stop_processes_with(
+        win_native::scan_cli_processes,
+        "[i] 当前没有正在运行的 agy CLI 进程。",
+        " agy CLI 进程",
+        "[OK] 所有 agy CLI 进程已退出。",
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1313,10 +2033,6 @@ pub fn build_bypass_lists(settings: &ProxySettings) -> (String, String, usize) {
         if is_ip_or_cidr {
             chromium.push(clean.clone());
             no_proxy.push(clean);
-        } else if !clean.contains('.') {
-            chromium.push(clean.clone());
-            chromium.push(format!("*.{clean}"));
-            no_proxy.push(format!(".{clean}"));
         } else {
             chromium.push(clean.clone());
             chromium.push(format!("*.{clean}"));
@@ -1327,10 +2043,8 @@ pub fn build_bypass_lists(settings: &ProxySettings) -> (String, String, usize) {
     (chromium.join(";"), no_proxy.join(","), custom_count)
 }
 
-fn apply_proxy_env_and_args(cmd: &mut Command, settings: &ProxySettings, proxy_url: &str) {
-    let (chromium_bypass, env_no_proxy, _) = build_bypass_lists(settings);
-    cmd.arg(format!("--proxy-server={proxy_url}"));
-    cmd.arg(format!("--proxy-bypass-list={chromium_bypass}"));
+fn apply_proxy_env_only(cmd: &mut Command, settings: &ProxySettings, proxy_url: &str) -> String {
+    let (_, env_no_proxy, _) = build_bypass_lists(settings);
     for key in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -1345,6 +2059,93 @@ fn apply_proxy_env_and_args(cmd: &mut Command, settings: &ProxySettings, proxy_u
         cmd.env(key, &env_no_proxy);
     }
     cmd.env("NODE_USE_ENV_PROXY", "1");
+    env_no_proxy
+}
+
+fn apply_proxy_env_and_args(cmd: &mut Command, settings: &ProxySettings, proxy_url: &str) {
+    let (chromium_bypass, _, _) = build_bypass_lists(settings);
+    cmd.arg(format!("--proxy-server={proxy_url}"));
+    cmd.arg(format!("--proxy-bypass-list={chromium_bypass}"));
+    apply_proxy_env_only(cmd, settings, proxy_url);
+}
+
+pub fn split_command_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut has_token = false;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_double {
+            if ch == '\\' && chars.peek() == Some(&'"') {
+                cur.push(chars.next().unwrap());
+            } else if ch == '"' {
+                in_double = false;
+            } else {
+                cur.push(ch);
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                cur.push(ch);
+            }
+        } else {
+            match ch {
+                '"' => {
+                    in_double = true;
+                    has_token = true;
+                }
+                '\'' => {
+                    in_single = true;
+                    has_token = true;
+                }
+                c if c.is_whitespace() => {
+                    if has_token {
+                        args.push(std::mem::take(&mut cur));
+                        has_token = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    has_token = true;
+                }
+            }
+        }
+    }
+
+    if has_token {
+        args.push(cur);
+    }
+    args
+}
+
+fn ensure_listening_port(settings: &ProxySettings, logs: &mut Vec<String>) -> Result<u16, (u16, String)> {
+    let (mut target_port, _, is_listening, _) = resolve_port(settings);
+    if is_listening {
+        return Ok(target_port);
+    }
+    if settings.auto_start_clash && Path::new(settings.clash_verge_path.trim()).is_file() {
+        let (started_port, clash_logs) = start_clash_verge(settings);
+        logs.extend(clash_logs);
+        if started_port == 0 {
+            return Err((
+                target_port,
+                "自动启动 Clash Verge 后端口仍未就绪，请确认 Clash Verge 正常运行。".to_string(),
+            ));
+        }
+        target_port = started_port;
+        Ok(target_port)
+    } else {
+        let msg = format!(
+            "本地代理端口 {}:{} 未监听，请先启动 Clash Verge。",
+            settings.proxy_host, target_port
+        );
+        logs.push(format!("[X] {msg}"));
+        Err((target_port, msg))
+    }
 }
 
 /// 账号切换后重启 Antigravity：调用前进程应已停止。
@@ -1423,6 +2224,994 @@ pub fn launch_antigravity_after_stop(settings: &ProxySettings) -> (bool, Vec<Str
     }
 }
 
+pub fn prepend_path_entry(existing: &str, dir: &str) -> (String, bool) {
+    let target_key = normalize_path_key(dir);
+    if target_key.is_empty() {
+        return (existing.to_string(), false);
+    }
+    let clean_dir = dir.trim().trim_end_matches(['\\', '/']);
+    let existing_entries: Vec<&str> = existing
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if existing_entries.first().map(|s| normalize_path_key(s)) == Some(target_key.clone())
+        && existing_entries
+            .iter()
+            .skip(1)
+            .all(|s| normalize_path_key(s) != target_key)
+    {
+        return (existing.to_string(), false);
+    }
+
+    let mut next: Vec<String> = Vec::with_capacity(existing_entries.len() + 1);
+    next.push(clean_dir.to_string());
+    for entry in existing_entries {
+        if normalize_path_key(entry) != target_key {
+            next.push(entry.to_string());
+        }
+    }
+    (next.join(";"), true)
+}
+
+pub fn remove_path_entry(existing: &str, dir: &str) -> (String, bool) {
+    let target_key = normalize_path_key(dir);
+    if target_key.is_empty() {
+        return (existing.to_string(), false);
+    }
+    let mut kept = Vec::new();
+    let mut removed = false;
+    for entry in existing.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        if normalize_path_key(entry) == target_key {
+            removed = true;
+        } else {
+            kept.push(entry.to_string());
+        }
+    }
+    if !removed {
+        return (existing.to_string(), false);
+    }
+    (kept.join(";"), true)
+}
+
+fn path_contains_entry(existing: &str, dir: &str) -> bool {
+    let target_key = normalize_path_key(dir);
+    if target_key.is_empty() {
+        return false;
+    }
+    existing
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|s| normalize_path_key(s) == target_key)
+}
+
+pub fn render_cli_shim_scripts(target_exe: &str, proxy_url: &str, no_proxy: &str) -> (String, String, String) {
+    let esc_cmd = |s: &str| s.replace('%', "%%");
+    let esc_ps = |s: &str| s.replace('\'', "''");
+    let esc_sh = |s: &str| s.replace('\'', "'\\''");
+
+    let proxy_cmd = esc_cmd(proxy_url);
+    let no_proxy_cmd = esc_cmd(no_proxy);
+    let target_cmd = esc_cmd(target_exe);
+
+    let agy_cmd = format!(
+        "@echo off\r\n\
+setlocal EnableExtensions\r\n\
+set \"HTTP_PROXY={proxy_cmd}\"\r\n\
+set \"HTTPS_PROXY={proxy_cmd}\"\r\n\
+set \"ALL_PROXY={proxy_cmd}\"\r\n\
+set \"http_proxy={proxy_cmd}\"\r\n\
+set \"https_proxy={proxy_cmd}\"\r\n\
+set \"all_proxy={proxy_cmd}\"\r\n\
+set \"NO_PROXY={no_proxy_cmd}\"\r\n\
+set \"no_proxy={no_proxy_cmd}\"\r\n\
+set \"NODE_USE_ENV_PROXY=1\"\r\n\
+\"{target_cmd}\" %*\r\n\
+set \"AGYDOCK_EXIT=%ERRORLEVEL%\"\r\n\
+endlocal & exit /b %AGYDOCK_EXIT%\r\n"
+    );
+
+    let proxy_ps = esc_ps(proxy_url);
+    let no_proxy_ps = esc_ps(no_proxy);
+    let target_ps = esc_ps(target_exe);
+
+    let agy_ps1 = format!(
+        "$ErrorActionPreference = 'Stop'\r\n\
+$__agydockPrev = @{{}}\r\n\
+$__agydockVars = @{{\r\n\
+  'HTTP_PROXY' = '{proxy_ps}'\r\n\
+  'HTTPS_PROXY' = '{proxy_ps}'\r\n\
+  'ALL_PROXY' = '{proxy_ps}'\r\n\
+  'http_proxy' = '{proxy_ps}'\r\n\
+  'https_proxy' = '{proxy_ps}'\r\n\
+  'all_proxy' = '{proxy_ps}'\r\n\
+  'NO_PROXY' = '{no_proxy_ps}'\r\n\
+  'no_proxy' = '{no_proxy_ps}'\r\n\
+  'NODE_USE_ENV_PROXY' = '1'\r\n\
+}}\r\n\
+foreach ($k in $__agydockVars.Keys) {{\r\n\
+  $__agydockPrev[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')\r\n\
+  [Environment]::SetEnvironmentVariable($k, $__agydockVars[$k], 'Process')\r\n\
+}}\r\n\
+$__agydockExit = 0\r\n\
+try {{\r\n\
+  & '{target_ps}' @args\r\n\
+  if ($null -ne $LASTEXITCODE) {{ $__agydockExit = [int]$LASTEXITCODE }}\r\n\
+}} finally {{\r\n\
+  foreach ($k in $__agydockPrev.Keys) {{\r\n\
+    [Environment]::SetEnvironmentVariable($k, $__agydockPrev[$k], 'Process')\r\n\
+  }}\r\n\
+}}\r\n\
+exit $__agydockExit\r\n"
+    );
+
+    let proxy_sh = esc_sh(proxy_url);
+    let no_proxy_sh = esc_sh(no_proxy);
+    let target_unix = target_exe.replace('\\', "/");
+    let target_unix_sh = esc_sh(&target_unix);
+
+    let agy_sh = format!(
+        "#!/usr/bin/env sh\n\
+export HTTP_PROXY='{proxy_sh}'\n\
+export HTTPS_PROXY='{proxy_sh}'\n\
+export ALL_PROXY='{proxy_sh}'\n\
+export http_proxy='{proxy_sh}'\n\
+export https_proxy='{proxy_sh}'\n\
+export all_proxy='{proxy_sh}'\n\
+export NO_PROXY='{no_proxy_sh}'\n\
+export no_proxy='{no_proxy_sh}'\n\
+export NODE_USE_ENV_PROXY='1'\n\
+exec '{target_unix_sh}' \"$@\"\n"
+    );
+
+    (agy_cmd, agy_ps1, agy_sh)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShimMeta {
+    target_exe: String,
+    proxy_url: String,
+    no_proxy: String,
+    updated_at: String,
+}
+
+fn write_cli_shim_files(
+    shim_dir: &Path,
+    settings: &ProxySettings,
+    proxy_port: u16,
+) -> Result<String, String> {
+    let target_exe = settings.cli_path.trim();
+    if target_exe.is_empty() || !Path::new(target_exe).is_file() {
+        return Err(format!("找不到 Antigravity CLI (agy.exe): {target_exe}"));
+    }
+    if is_inside_dir(Path::new(target_exe), shim_dir) {
+        return Err("CLI 路径不能指向 AgyDock Shim 目录自身，请先选择真实的 agy.exe。".to_string());
+    }
+
+    fs::create_dir_all(shim_dir).map_err(|e| format!("无法创建 Shim 目录: {e}"))?;
+    let proxy_url = format!("http://{}:{}", settings.proxy_host, proxy_port);
+    let (_, no_proxy, _) = build_bypass_lists(settings);
+    let (cmd_script, ps1_script, sh_script) =
+        render_cli_shim_scripts(target_exe, &proxy_url, &no_proxy);
+
+    fs::write(shim_dir.join("agy.cmd"), cmd_script.as_bytes())
+        .map_err(|e| format!("写入 agy.cmd 失败: {e}"))?;
+    fs::write(shim_dir.join("agy.ps1"), ps1_script.as_bytes())
+        .map_err(|e| format!("写入 agy.ps1 失败: {e}"))?;
+    fs::write(shim_dir.join("agy"), sh_script.as_bytes())
+        .map_err(|e| format!("写入 agy 失败: {e}"))?;
+
+    let meta = ShimMeta {
+        target_exe: target_exe.to_string(),
+        proxy_url: proxy_url.clone(),
+        no_proxy,
+        updated_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+    let meta_json = serde_json::to_string_pretty(&meta)
+        .map_err(|e| format!("序列化 Shim 元数据失败: {e}"))?;
+    fs::write(shim_dir.join("shim-meta.json"), meta_json.as_bytes())
+        .map_err(|e| format!("写入 shim-meta.json 失败: {e}"))?;
+
+    Ok(proxy_url)
+}
+
+pub fn get_cli_shim_status(settings: &ProxySettings, resolved_port: u16) -> CliShimStatus {
+    let shim_dir = cli_shim_dir();
+    let shim_dir_str = shim_dir.to_string_lossy().to_string();
+    let in_user_path = win_native::read_user_path()
+        .map(|(p, _)| path_contains_entry(&p, &shim_dir_str))
+        .unwrap_or(false);
+
+    let scripts_ok = shim_dir.join("agy.cmd").is_file()
+        && shim_dir.join("agy.ps1").is_file()
+        && shim_dir.join("agy").is_file();
+    let meta = fs::read_to_string(shim_dir.join("shim-meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<ShimMeta>(&s).ok());
+
+    let proxy_url = format!("http://{}:{}", settings.proxy_host, resolved_port);
+    let (_, expected_no_proxy, _) = build_bypass_lists(settings);
+
+    let cli_path_trimmed = settings.cli_path.trim().to_string();
+    let cli_detected = !cli_path_trimmed.is_empty()
+        && Path::new(&cli_path_trimmed).is_file()
+        && !is_inside_dir(Path::new(&cli_path_trimmed), &shim_dir);
+
+    let enabled = in_user_path;
+    let out_of_sync = enabled
+        && (!scripts_ok
+            || meta
+                .as_ref()
+                .map(|m| {
+                    normalize_path_key(&m.target_exe) != normalize_path_key(&cli_path_trimmed)
+                        || m.proxy_url != proxy_url
+                        || m.no_proxy != expected_no_proxy
+                })
+                .unwrap_or(true));
+
+    let target_exe = meta.map(|m| m.target_exe).unwrap_or_default();
+
+    CliShimStatus {
+        enabled,
+        in_user_path,
+        shim_dir: shim_dir_str,
+        target_exe,
+        proxy_url,
+        out_of_sync,
+        cli_detected,
+        cli_path: cli_path_trimmed,
+    }
+}
+
+pub fn enable_cli_shim(settings: &ProxySettings) -> ActionResponse {
+    let mut logs = Vec::new();
+    let shim_dir = cli_shim_dir();
+    let shim_dir_str = shim_dir.to_string_lossy().to_string();
+    let (port, _, is_listening, _) = resolve_port(settings);
+
+    let proxy_url = match write_cli_shim_files(&shim_dir, settings, port) {
+        Ok(url) => url,
+        Err(msg) => {
+            logs.push(format!("[X] {msg}"));
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: port,
+                logs,
+                error: Some(msg),
+            };
+        }
+    };
+
+    match win_native::read_user_path() {
+        Ok((existing, is_expand_sz)) => {
+            let (next_path, changed) = prepend_path_entry(&existing, &shim_dir_str);
+            if changed {
+                if let Err(err) = win_native::write_user_path(&next_path, is_expand_sz) {
+                    logs.push(format!("[X] {err}"));
+                    return ActionResponse {
+                        ok: false,
+                        need_confirm: false,
+                        process_count: 0,
+                        resolved_port: port,
+                        logs,
+                        error: Some(err),
+                    };
+                }
+                logs.push(format!(
+                    "[OK] 已将隔离 CLI Shim 目录加入用户 PATH: {shim_dir_str}"
+                ));
+            } else {
+                logs.push(format!(
+                    "[OK] 已同步 CLI Shim 脚本 -> {proxy_url} ({})",
+                    settings.cli_path
+                ));
+            }
+        }
+        Err(err) => {
+            logs.push(format!("[X] {err}"));
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: port,
+                logs,
+                error: Some(err),
+            };
+        }
+    }
+
+    logs.push(format!(
+        "[OK] CLI Proxy Shim 已就绪: agy -> {proxy_url}（新开终端或新启动的 PATH 调用工具自动生效）"
+    ));
+    if !is_listening {
+        logs.push(format!(
+            "[!] 当前本地代理端口 {}:{} 未监听，启动 Clash Verge 后即可正常连网。",
+            settings.proxy_host, port
+        ));
+    }
+
+    ActionResponse {
+        ok: true,
+        need_confirm: false,
+        process_count: 0,
+        resolved_port: port,
+        logs,
+        error: None,
+    }
+}
+
+pub fn disable_cli_shim() -> ActionResponse {
+    let mut logs = Vec::new();
+    let shim_dir = cli_shim_dir();
+    let shim_dir_str = shim_dir.to_string_lossy().to_string();
+
+    match win_native::read_user_path() {
+        Ok((existing, is_expand_sz)) => {
+            let (next_path, changed) = remove_path_entry(&existing, &shim_dir_str);
+            if changed {
+                if let Err(err) = win_native::write_user_path(&next_path, is_expand_sz) {
+                    logs.push(format!("[X] {err}"));
+                    return ActionResponse {
+                        ok: false,
+                        need_confirm: false,
+                        process_count: 0,
+                        resolved_port: 0,
+                        logs,
+                        error: Some(err),
+                    };
+                }
+                logs.push(format!(
+                    "[OK] 已从用户 PATH 移除 CLI Shim 目录: {shim_dir_str}"
+                ));
+            } else {
+                logs.push("[i] 用户 PATH 中未包含 CLI Shim 目录。".to_string());
+            }
+        }
+        Err(err) => {
+            logs.push(format!("[X] {err}"));
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: 0,
+                logs,
+                error: Some(err),
+            };
+        }
+    }
+
+    for fname in ["agy.cmd", "agy.ps1", "agy", "shim-meta.json"] {
+        let p = shim_dir.join(fname);
+        if p.is_file() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    if shim_dir.is_dir() {
+        let _ = fs::remove_dir(&shim_dir);
+    }
+
+    logs.push("[OK] 已清理 CLI Proxy Shim 脚本（对原 agy.exe 与系统环境变量零改动）。".to_string());
+    ActionResponse {
+        ok: true,
+        need_confirm: false,
+        process_count: 0,
+        resolved_port: 0,
+        logs,
+        error: None,
+    }
+}
+
+pub fn sync_cli_shim_if_enabled(settings: &ProxySettings) -> bool {
+    let shim_dir = cli_shim_dir();
+    let shim_dir_str = shim_dir.to_string_lossy().to_string();
+    let Ok((user_path, _)) = win_native::read_user_path() else {
+        return false;
+    };
+    if !path_contains_entry(&user_path, &shim_dir_str) {
+        return false;
+    }
+    let (port, _, _, _) = resolve_port(settings);
+    write_cli_shim_files(&shim_dir, settings, port).is_ok()
+}
+
+pub fn launch_isolated_cli_tool(
+    settings: &ProxySettings,
+    tool_id: &str,
+    force_restart: bool,
+) -> ActionResponse {
+    let mut logs = Vec::new();
+    let Some(tool) = settings.cli_tools.iter().find(|t| t.id == tool_id) else {
+        let msg = format!("找不到指定的 CLI 工具配置: {tool_id}");
+        logs.push(format!("[X] {msg}"));
+        return ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs,
+            error: Some(msg),
+        };
+    };
+
+    let exe_path = Path::new(tool.exe_path.trim());
+    if tool.exe_path.trim().is_empty() || !exe_path.is_file() {
+        let msg = format!("找不到 {} 可执行文件: {}", tool.name, tool.exe_path);
+        logs.push(format!("[X] {msg}"));
+        return ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs,
+            error: Some(msg),
+        };
+    }
+
+    let target_port = match ensure_listening_port(settings, &mut logs) {
+        Ok(p) => p,
+        Err((p, msg)) => {
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: p,
+                logs,
+                error: Some(msg),
+            };
+        }
+    };
+
+    let existing = win_native::scan_tool_process_tree(&tool.exe_path);
+    if !existing.is_empty() {
+        if !force_restart {
+            return ActionResponse {
+                ok: false,
+                need_confirm: true,
+                process_count: existing.len(),
+                resolved_port: target_port,
+                logs,
+                error: None,
+            };
+        }
+        let (stopped, stop_logs) = stop_cli_tool_processes(&tool.exe_path, &tool.name);
+        logs.extend(stop_logs);
+        if !stopped {
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: existing.len(),
+                resolved_port: target_port,
+                logs,
+                error: Some(format!(
+                    "部分旧 {} 进程未能退出，请手动完全退出后再试。",
+                    tool.name
+                )),
+            };
+        }
+    }
+
+    let proxy_url = format!("http://{}:{}", settings.proxy_host, target_port);
+    let ext_lower = exe_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut cmd = if ext_lower == "cmd" || ext_lower == "bat" {
+        let mut c = Command::new("cmd.exe");
+        c.args(["/C", tool.exe_path.trim()]);
+        c
+    } else {
+        Command::new(exe_path)
+    };
+
+    let work_dir = tool.working_dir.trim();
+    if !work_dir.is_empty() && Path::new(work_dir).is_dir() {
+        cmd.current_dir(work_dir);
+    } else if let Some(dir) = exe_path.parent() {
+        cmd.current_dir(dir);
+    }
+
+    if tool.is_chromium {
+        apply_proxy_env_and_args(&mut cmd, settings, &proxy_url);
+        if settings.disable_quic {
+            cmd.arg("--disable-quic");
+        }
+    } else {
+        apply_proxy_env_only(&mut cmd, settings, &proxy_url);
+    }
+
+    for arg in split_command_args(&tool.args) {
+        cmd.arg(arg);
+    }
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let mode_tag = if tool.is_chromium {
+                "Chromium + 环境变量"
+            } else {
+                "环境变量隔离"
+            };
+            logs.push(format!(
+                "[OK] {} 已以独立代理启动 (PID {}, {}) -> {}（子进程 agy CLI 将自动继承代理）",
+                tool.name,
+                child.id(),
+                mode_tag,
+                proxy_url
+            ));
+            ActionResponse {
+                ok: true,
+                need_confirm: false,
+                process_count: 1,
+                resolved_port: target_port,
+                logs,
+                error: None,
+            }
+        }
+        Err(err) => {
+            let msg = format!("启动 {} 失败: {err}", tool.name);
+            logs.push(format!("[X] {msg}"));
+            ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: target_port,
+                logs,
+                error: Some(msg),
+            }
+        }
+    }
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn encode_powershell_utf16le_base64(script: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+pub fn launch_isolated_cli_terminal(settings: &ProxySettings) -> ActionResponse {
+    let mut logs = Vec::new();
+    let target_port = match ensure_listening_port(settings, &mut logs) {
+        Ok(p) => p,
+        Err((p, msg)) => {
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: p,
+                logs,
+                error: Some(msg),
+            };
+        }
+    };
+
+    let proxy_url = format!("http://{}:{}", settings.proxy_host, target_port);
+    let (_, env_no_proxy, _) = build_bypass_lists(settings);
+
+    let workdir = {
+        let ws = settings.workspace_path.trim();
+        if !ws.is_empty() && Path::new(ws).is_dir() {
+            PathBuf::from(ws)
+        } else {
+            dirs::home_dir()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."))
+        }
+    };
+
+    let cli_dir = Path::new(settings.cli_path.trim())
+        .parent()
+        .filter(|_| !settings.cli_path.trim().is_empty() && Path::new(settings.cli_path.trim()).is_file())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let esc_ps = |s: &str| s.replace('\'', "''");
+    let mut ps_lines = vec![
+        format!("$env:HTTP_PROXY = '{}'", esc_ps(&proxy_url)),
+        format!("$env:HTTPS_PROXY = '{}'", esc_ps(&proxy_url)),
+        format!("$env:ALL_PROXY = '{}'", esc_ps(&proxy_url)),
+        format!("$env:http_proxy = '{}'", esc_ps(&proxy_url)),
+        format!("$env:https_proxy = '{}'", esc_ps(&proxy_url)),
+        format!("$env:all_proxy = '{}'", esc_ps(&proxy_url)),
+        format!("$env:NO_PROXY = '{}'", esc_ps(&env_no_proxy)),
+        format!("$env:no_proxy = '{}'", esc_ps(&env_no_proxy)),
+        "$env:NODE_USE_ENV_PROXY = '1'".to_string(),
+    ];
+    if let Some(ref dir) = cli_dir {
+        ps_lines.push(format!(
+            "$env:PATH = '{};' + $env:PATH",
+            esc_ps(dir)
+        ));
+    }
+    ps_lines.push(format!(
+        "Write-Host '[AgyDock] 隔离代理终端已就绪 -> {} (仅当前终端有效)' -ForegroundColor Green",
+        esc_ps(&proxy_url)
+    ));
+    if cli_dir.is_some() {
+        ps_lines.push("Write-Host '[AgyDock] 可直接执行 agy / agy models / agy acp' -ForegroundColor DarkGray".to_string());
+    } else {
+        ps_lines.push("Write-Host '[AgyDock] 未检测到 agy.exe，请先在设置中配置 Antigravity CLI 路径' -ForegroundColor Yellow".to_string());
+    }
+
+    let encoded = encode_powershell_utf16le_base64(&ps_lines.join("\n"));
+
+    let wt_exe = find_executable_on_path("wt.exe");
+    let pwsh_exe = find_executable_on_path("pwsh.exe");
+    let powershell_exe = find_executable_on_path("powershell.exe");
+
+    let (term_label, mut cmd) = if let Some(wt) = wt_exe {
+        let shell_bin = pwsh_exe
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "powershell.exe".to_string());
+        let mut c = Command::new(wt);
+        let wd_raw = workdir.to_string_lossy().to_string();
+        let wd_safe = if wd_raw.len() > 3 {
+            wd_raw.trim_end_matches('\\').to_string()
+        } else {
+            wd_raw
+        };
+        c.arg("-d")
+            .arg(wd_safe)
+            .arg(shell_bin)
+            .arg("-NoExit")
+            .arg("-EncodedCommand")
+            .arg(&encoded);
+        ("Windows Terminal", c)
+    } else if let Some(pwsh) = pwsh_exe {
+        let mut c = Command::new(pwsh);
+        c.arg("-NoExit").arg("-EncodedCommand").arg(&encoded);
+        ("PowerShell 7", c)
+    } else if let Some(ps) = powershell_exe {
+        let mut c = Command::new(ps);
+        c.arg("-NoExit").arg("-EncodedCommand").arg(&encoded);
+        ("Windows PowerShell", c)
+    } else {
+        let esc_cmd = |s: &str| s.replace('%', "%%");
+        let path_part = cli_dir
+            .as_ref()
+            .map(|d| format!("set \"PATH={};%PATH%\" & ", esc_cmd(d)))
+            .unwrap_or_default();
+        let init_cmd = format!(
+            "set \"HTTP_PROXY={p}\" & set \"HTTPS_PROXY={p}\" & set \"ALL_PROXY={p}\" & set \"http_proxy={p}\" & set \"https_proxy={p}\" & set \"all_proxy={p}\" & set \"NO_PROXY={np}\" & set \"no_proxy={np}\" & set \"NODE_USE_ENV_PROXY=1\" & {path_part}echo [AgyDock] 隔离代理终端已就绪 -^> {p}",
+            p = esc_cmd(&proxy_url),
+            np = esc_cmd(&env_no_proxy)
+        );
+        let mut c = Command::new("cmd.exe");
+        c.args(["/K", &init_cmd]);
+        ("cmd.exe", c)
+    };
+
+    cmd.current_dir(&workdir);
+    apply_proxy_env_only(&mut cmd, settings, &proxy_url);
+    if let Some(ref dir) = cli_dir {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let (next_path, _) = prepend_path_entry(&current_path, dir);
+        cmd.env("PATH", next_path);
+    }
+
+    match cmd.spawn() {
+        Ok(child) => {
+            logs.push(format!(
+                "[OK] 已打开 {term_label} 隔离代理终端 (PID {}) -> {proxy_url}",
+                child.id()
+            ));
+            ActionResponse {
+                ok: true,
+                need_confirm: false,
+                process_count: 1,
+                resolved_port: target_port,
+                logs,
+                error: None,
+            }
+        }
+        Err(err) => {
+            let msg = format!("打开隔离代理终端失败: {err}");
+            logs.push(format!("[X] {msg}"));
+            ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: target_port,
+                logs,
+                error: Some(msg),
+            }
+        }
+    }
+}
+
+pub fn test_cli_proxy(settings: &ProxySettings) -> ActionResponse {
+    let mut logs = Vec::new();
+    let cli_trimmed = settings.cli_path.trim();
+    let cli_path = Path::new(cli_trimmed);
+    if cli_trimmed.is_empty() || !cli_path.is_file() {
+        let msg = "未配置或找不到 Antigravity CLI (agy.exe)，请先在设置中配置或点击「重新探测」。".to_string();
+        logs.push(format!("[X] {msg}"));
+        return ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs,
+            error: Some(msg),
+        };
+    }
+    if is_inside_dir(cli_path, &cli_shim_dir()) {
+        let msg = "CLI 路径不能指向 AgyDock Shim 目录自身，请重新探测真实的 agy.exe。".to_string();
+        logs.push(format!("[X] {msg}"));
+        return ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: 0,
+            logs,
+            error: Some(msg),
+        };
+    }
+
+    let target_port = match ensure_listening_port(settings, &mut logs) {
+        Ok(p) => p,
+        Err((p, msg)) => {
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: p,
+                logs,
+                error: Some(msg),
+            };
+        }
+    };
+
+    let proxy_url = format!("http://{}:{}", settings.proxy_host, target_port);
+    logs.push(format!(
+        "[..] 正在通过隔离代理 ({proxy_url}) 测试 CLI: \"{cli_trimmed}\" models"
+    ));
+
+    let mut cmd = Command::new(cli_path);
+    cmd.arg("models")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(parent) = cli_path.parent() {
+        cmd.current_dir(parent);
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    apply_proxy_env_only(&mut cmd, settings, &proxy_url);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            let msg = format!("启动 agy.exe 失败: {err}");
+            logs.push(format!("[X] {msg}"));
+            return ActionResponse {
+                ok: false,
+                need_confirm: false,
+                process_count: 0,
+                resolved_port: target_port,
+                logs,
+                error: Some(msg),
+            };
+        }
+    };
+
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).to_string()
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).to_string()
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut exit_status = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => {
+                let msg = format!("等待 CLI 返回失败: {err}");
+                logs.push(format!("[X] {msg}"));
+                return ActionResponse {
+                    ok: false,
+                    need_confirm: false,
+                    process_count: 0,
+                    resolved_port: target_port,
+                    logs,
+                    error: Some(msg),
+                };
+            }
+        }
+    }
+
+    let stdout_text = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr_text = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if timed_out {
+        let msg = "CLI 连通性测试超时（15 秒），请确认代理节点可用。".to_string();
+        logs.push(format!("[X] {msg}"));
+        return ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: target_port,
+            logs,
+            error: Some(msg),
+        };
+    }
+
+    let ok = exit_status.map(|s| s.success()).unwrap_or(false);
+    let model_lines: Vec<&str> = stdout_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("Fetching"))
+        .collect();
+
+    if ok && !model_lines.is_empty() {
+        logs.push(format!(
+            "[OK] CLI 隔离代理连通性测试通过：获取 {} 个可用模型。",
+            model_lines.len()
+        ));
+        for line in model_lines.iter().take(5) {
+            logs.push(format!("    {line}"));
+        }
+        if model_lines.len() > 5 {
+            logs.push(format!("    ... 及另外 {} 个模型", model_lines.len() - 5));
+        }
+        ActionResponse {
+            ok: true,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: target_port,
+            logs,
+            error: None,
+        }
+    } else {
+        let code = exit_status.and_then(|s| s.code()).unwrap_or(-1);
+        for line in stderr_text.lines().chain(stdout_text.lines()).take(10) {
+            let t = line.trim();
+            if !t.is_empty() {
+                logs.push(format!("    {t}"));
+            }
+        }
+        let msg = format!("CLI 测试未通过 (退出码 {code})，请检查节点连通性或 CLI 登录状态。");
+        logs.push(format!("[X] {msg}"));
+        ActionResponse {
+            ok: false,
+            need_confirm: false,
+            process_count: 0,
+            resolved_port: target_port,
+            logs,
+            error: Some(msg),
+        }
+    }
+}
+
+pub fn build_cli_shell_snippets(settings: &ProxySettings, proxy_port: u16) -> CliShellSnippets {
+    let proxy_url = format!("http://{}:{}", settings.proxy_host, proxy_port);
+    let (_, env_no_proxy, _) = build_bypass_lists(settings);
+    let cli_dir = Path::new(settings.cli_path.trim())
+        .parent()
+        .filter(|_| !settings.cli_path.trim().is_empty() && Path::new(settings.cli_path.trim()).is_file())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let esc_ps = |s: &str| s.replace('\'', "''");
+    let esc_sh = |s: &str| s.replace('\'', "'\\''");
+    let esc_cmd = |s: &str| s.replace('%', "%%");
+
+    let mut ps_parts = vec![
+        format!("$env:HTTP_PROXY='{}'", esc_ps(&proxy_url)),
+        format!("$env:HTTPS_PROXY='{}'", esc_ps(&proxy_url)),
+        format!("$env:ALL_PROXY='{}'", esc_ps(&proxy_url)),
+        format!("$env:http_proxy='{}'", esc_ps(&proxy_url)),
+        format!("$env:https_proxy='{}'", esc_ps(&proxy_url)),
+        format!("$env:all_proxy='{}'", esc_ps(&proxy_url)),
+        format!("$env:NO_PROXY='{}'", esc_ps(&env_no_proxy)),
+        format!("$env:no_proxy='{}'", esc_ps(&env_no_proxy)),
+        "$env:NODE_USE_ENV_PROXY='1'".to_string(),
+    ];
+    if let Some(ref dir) = cli_dir {
+        ps_parts.push(format!("$env:PATH='{};'+$env:PATH", esc_ps(dir)));
+    }
+
+    let mut cmd_parts = vec![
+        format!("set \"HTTP_PROXY={}\"", esc_cmd(&proxy_url)),
+        format!("set \"HTTPS_PROXY={}\"", esc_cmd(&proxy_url)),
+        format!("set \"ALL_PROXY={}\"", esc_cmd(&proxy_url)),
+        format!("set \"http_proxy={}\"", esc_cmd(&proxy_url)),
+        format!("set \"https_proxy={}\"", esc_cmd(&proxy_url)),
+        format!("set \"all_proxy={}\"", esc_cmd(&proxy_url)),
+        format!("set \"NO_PROXY={}\"", esc_cmd(&env_no_proxy)),
+        format!("set \"no_proxy={}\"", esc_cmd(&env_no_proxy)),
+        "set \"NODE_USE_ENV_PROXY=1\"".to_string(),
+    ];
+    if let Some(ref dir) = cli_dir {
+        cmd_parts.push(format!("set \"PATH={};%PATH%\"", esc_cmd(dir)));
+    }
+
+    let mut bash_parts = vec![
+        format!("export HTTP_PROXY='{}'", esc_sh(&proxy_url)),
+        format!("export HTTPS_PROXY='{}'", esc_sh(&proxy_url)),
+        format!("export ALL_PROXY='{}'", esc_sh(&proxy_url)),
+        format!("export http_proxy='{}'", esc_sh(&proxy_url)),
+        format!("export https_proxy='{}'", esc_sh(&proxy_url)),
+        format!("export all_proxy='{}'", esc_sh(&proxy_url)),
+        format!("export NO_PROXY='{}'", esc_sh(&env_no_proxy)),
+        format!("export no_proxy='{}'", esc_sh(&env_no_proxy)),
+        "export NODE_USE_ENV_PROXY='1'".to_string(),
+    ];
+    if let Some(ref dir) = cli_dir {
+        let unix_dir = dir.replace('\\', "/");
+        bash_parts.push(format!("export PATH='{}:$PATH'", esc_sh(&unix_dir)));
+    }
+
+    CliShellSnippets {
+        proxy_url,
+        powershell: ps_parts.join("; "),
+        cmd: cmd_parts.join(" && "),
+        bash: bash_parts.join("; "),
+    }
+}
+
 pub fn build_dry_run_preview(settings: &ProxySettings, proxy_port: u16) -> String {
     let proxy_url = format!("http://{}:{}", settings.proxy_host, proxy_port);
     let (chromium_bypass, env_no_proxy, custom_count) = build_bypass_lists(settings);
@@ -1453,15 +3242,47 @@ pub fn build_dry_run_preview(settings: &ProxySettings, proxy_port: u16) -> Strin
         "关闭（仅绕过本机回环地址）".to_string()
     };
 
+    let cli_display = if settings.cli_path.trim().is_empty() {
+        "未检测到".to_string()
+    } else {
+        settings.cli_path.clone()
+    };
+    let shim = get_cli_shim_status(settings, proxy_port);
+    let shim_display = if shim.enabled {
+        format!(
+            "已启用{} ({})",
+            if shim.out_of_sync { " [待同步]" } else { "" },
+            shim.shim_dir
+        )
+    } else {
+        format!("未启用 ({})", shim.shim_dir)
+    };
+    let tools_display = if settings.cli_tools.is_empty() {
+        "暂无".to_string()
+    } else {
+        settings
+            .cli_tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     [
         "[DryRun 启动参数预览]".to_string(),
         format!("  目标程序   : {}", settings.antigravity_path),
+        format!("  CLI 路径   : {cli_display}"),
+        format!("  CLI Shim   : {shim_display}"),
+        format!(
+            "  CLI 工具   : {} 项 ({tools_display})",
+            settings.cli_tools.len()
+        ),
         format!("  国内/内网直连: {bypass_summary}"),
         format!("  启动参数   : {}", args.join(" ")),
         format!("  子进程环境 : HTTP_PROXY = HTTPS_PROXY = ALL_PROXY = {proxy_url}"),
         format!("  子进程环境 : NO_PROXY = {env_no_proxy}"),
         "  子进程环境 : NODE_USE_ENV_PROXY = 1".to_string(),
-        "  系统影响   : 不改动 Windows 注册表代理，不改动 Clash Verge 配置，不开 TUN。".to_string(),
+        "  系统影响   : 不改动 Windows 注册表系统代理，不改动 Clash Verge 配置，不开 TUN。".to_string(),
     ]
     .join("\n")
 }
@@ -1482,38 +3303,19 @@ pub fn launch_isolated_antigravity(settings: &ProxySettings, force_restart: bool
         };
     }
 
-    let (mut target_port, _, is_listening, _) = resolve_port(settings);
-    if !is_listening {
-        if settings.auto_start_clash && Path::new(settings.clash_verge_path.trim()).is_file() {
-            let (started_port, clash_logs) = start_clash_verge(settings);
-            logs.extend(clash_logs);
-            if started_port == 0 {
-                return ActionResponse {
-                    ok: false,
-                    need_confirm: false,
-                    process_count: 0,
-                    resolved_port: target_port,
-                    logs,
-                    error: Some("自动启动 Clash Verge 后端口仍未就绪，请确认 Clash Verge 正常运行。".to_string()),
-                };
-            }
-            target_port = started_port;
-        } else {
-            let msg = format!(
-                "本地代理端口 {}:{} 未监听，请先启动 Clash Verge。",
-                settings.proxy_host, target_port
-            );
-            logs.push(format!("[X] {msg}"));
+    let target_port = match ensure_listening_port(settings, &mut logs) {
+        Ok(p) => p,
+        Err((p, msg)) => {
             return ActionResponse {
                 ok: false,
                 need_confirm: false,
                 process_count: 0,
-                resolved_port: target_port,
+                resolved_port: p,
                 logs,
                 error: Some(msg),
             };
         }
-    }
+    };
 
     let (existing, _) = win_native::scan_antigravity_and_clash(&settings.antigravity_path);
     if !existing.is_empty() {
@@ -1595,6 +3397,11 @@ pub fn verify_report_path() -> PathBuf {
     std::env::temp_dir().join("antigravity-launcher-verify.txt")
 }
 
+fn is_core_proxy_process_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with("language_server") || lower == "agy" || lower == "antigravity-cli"
+}
+
 pub fn run_cumulative_audit<F>(
     settings: &ProxySettings,
     seconds: u32,
@@ -1657,17 +3464,24 @@ where
         .iter()
         .filter(|c| c.category == ConnectionCategory::PublicDirect)
         .count();
-    let ls_direct = cumulative
+    let core_direct = cumulative
         .iter()
         .filter(|c| {
             c.category == ConnectionCategory::PublicDirect
-                && c.process_name.to_lowercase().starts_with("language_server")
+                && is_core_proxy_process_name(&c.process_name)
+        })
+        .count();
+    let cli_direct = cumulative
+        .iter()
+        .filter(|c| {
+            c.category == ConnectionCategory::PublicDirect
+                && matches!(c.process_name.to_lowercase().as_str(), "agy" | "antigravity-cli")
         })
         .count();
     let bypass_enabled =
         settings.bypass_china_and_lan || !settings.custom_bypass_domains.trim().is_empty();
 
-    let passed = if tun > 0 || ls_direct > 0 || (!bypass_enabled && direct > 0) {
+    let passed = if tun > 0 || core_direct > 0 || (!bypass_enabled && direct > 0) {
         Some(false)
     } else if proxied > 0 {
         Some(true)
@@ -1691,8 +3505,11 @@ where
             }
         ),
         format!(
-            "  进程数        : Antigravity x{}, language_server x{}",
-            latest.antigravity_proc_count, latest.language_server_proc_count
+            "  进程数        : Antigravity x{}, language_server x{}, agy CLI x{}, 工具 x{}",
+            latest.antigravity_proc_count,
+            latest.language_server_proc_count,
+            latest.cli_proc_count,
+            latest.tool_proc_count
         ),
     ];
 
@@ -1735,14 +3552,20 @@ where
         }
     }
     if direct > 0 {
-        if bypass_enabled && ls_direct == 0 {
+        if bypass_enabled && core_direct == 0 {
             lines.push(
-                "  [i] 检测到非 language_server 进程存在公网直连（已开启国内/内网直连绕过，访问国内站点时属正常现象）："
+                "  [i] 检测到非核心模型进程存在公网直连（已开启国内/内网直连绕过，访问国内站点时属正常现象）："
+                    .to_string(),
+            );
+        } else if cli_direct > 0 {
+            lines.push(
+                "  [X] 检测到 agy CLI 存在公网直连：请从「CLI 与工具独立代理」中隔离重启宿主工具（如 T3 Code），或开启 CLI Shim / 使用隔离终端。"
                     .to_string(),
             );
         } else {
             lines.push(
-                "  [X] 检测到公网直连，请关闭旧实例后用本面板重新启动 Antigravity。".to_string(),
+                "  [X] 检测到公网直连，请关闭旧实例后用本面板重新启动 Antigravity 或对应工具。"
+                    .to_string(),
             );
         }
         for item in cumulative
@@ -1769,7 +3592,7 @@ where
         }
     } else if passed.is_none() && !cancelled {
         lines.push(
-            "  [..] 观察期内应用未产生外部连接（空闲）。请在 Antigravity 中发一条消息后再验收。"
+            "  [..] 观察期内应用未产生外部连接（空闲）。请在 Antigravity、agy CLI 或接入工具中触发请求后再验收。"
                 .to_string(),
         );
     }
@@ -1887,5 +3710,107 @@ mod tests {
         assert!(preview.contains("--proxy-server=http://127.0.0.1:7897"));
         assert!(preview.contains("*.cn"));
         assert!(preview.contains("NODE_USE_ENV_PROXY = 1"));
+        assert!(preview.contains("CLI 路径"));
+        assert!(preview.contains("CLI Shim"));
+    }
+
+    #[test]
+    fn splits_command_args_preserving_quotes_and_windows_paths() {
+        let args = split_command_args(
+            "--config \"C:\\Program Files\\My App\\cfg.json\" --profile 'work space' --verbose",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--config",
+                "C:\\Program Files\\My App\\cfg.json",
+                "--profile",
+                "work space",
+                "--verbose"
+            ]
+        );
+        assert!(split_command_args("   ").is_empty());
+    }
+
+    #[test]
+    fn prepends_and_removes_path_entries_case_insensitively() {
+        let shim = r"C:\Users\alice\AppData\Local\AgyDock\cli-shim";
+        let base = r"C:\Windows\System32;D:\Tools";
+        let (added, changed) = prepend_path_entry(base, shim);
+        assert!(changed);
+        assert_eq!(added, format!("{shim};{base}"));
+
+        // Already first: no-op
+        let (same, changed_again) = prepend_path_entry(&added, &shim.to_uppercase());
+        assert!(!changed_again);
+        assert_eq!(same, added);
+
+        // Move from later position to front and deduplicate
+        let buried = format!(r"C:\Windows\System32;{shim}\;D:\Tools;{shim}");
+        let (moved, changed_moved) = prepend_path_entry(&buried, shim);
+        assert!(changed_moved);
+        assert_eq!(moved, format!(r"{shim};C:\Windows\System32;D:\Tools"));
+
+        // Remove cleanly
+        let (removed, changed_rm) = remove_path_entry(&moved, &shim.to_lowercase());
+        assert!(changed_rm);
+        assert_eq!(removed, r"C:\Windows\System32;D:\Tools");
+
+        // Remove when absent: no-op
+        let (noop, changed_noop) = remove_path_entry(&removed, shim);
+        assert!(!changed_noop);
+        assert_eq!(noop, removed);
+    }
+
+    #[test]
+    fn renders_cli_shim_scripts_with_isolation_and_escaping() {
+        let (cmd, ps1, sh) = render_cli_shim_scripts(
+            r"C:\Users\o'neil\%APP%\agy.exe",
+            "http://127.0.0.1:7897",
+            "localhost,127.0.0.1,.cn",
+        );
+        assert!(cmd.contains("setlocal EnableExtensions"));
+        assert!(cmd.contains("endlocal & exit /b %AGYDOCK_EXIT%"));
+        assert!(cmd.contains(r"C:\Users\o'neil\%%APP%%\agy.exe"));
+        assert!(cmd.contains("set \"HTTPS_PROXY=http://127.0.0.1:7897\""));
+
+        assert!(ps1.contains("try {"));
+        assert!(ps1.contains("finally {"));
+        assert!(ps1.contains(r"C:\Users\o''neil\%APP%\agy.exe"));
+
+        assert!(sh.contains("#!/usr/bin/env sh"));
+        assert!(sh.contains("exec 'C:/Users/o'\\''neil/%APP%/agy.exe' \"$@\""));
+    }
+
+    #[test]
+    fn builds_cli_shell_snippets_for_all_shells() {
+        let s = ProxySettings::default();
+        let snippets = build_cli_shell_snippets(&s, 7890);
+        assert_eq!(snippets.proxy_url, "http://127.0.0.1:7890");
+        assert!(snippets.powershell.contains("$env:HTTPS_PROXY='http://127.0.0.1:7890'"));
+        assert!(snippets.cmd.contains("set \"HTTPS_PROXY=http://127.0.0.1:7890\""));
+        assert!(snippets.bash.contains("export HTTPS_PROXY='http://127.0.0.1:7890'"));
+    }
+
+    #[test]
+    fn deserializes_legacy_proxy_settings_without_cli_fields() {
+        let legacy_json = r#"{
+            "proxyHost": "127.0.0.1",
+            "autoDetectPort": true,
+            "customPort": 7897,
+            "antigravityPath": "C:\\Apps\\Antigravity.exe",
+            "clashVergePath": "D:\\Clash\\clash-verge.exe",
+            "workspacePath": "",
+            "autoStartClash": true,
+            "disableQuic": true,
+            "showLoopbackIpc": false
+        }"#;
+        let parsed: ProxySettings = serde_json::from_str(legacy_json).unwrap();
+        assert!(parsed.bypass_china_and_lan);
+        assert_eq!(parsed.cli_path, "");
+        assert!(parsed.cli_tools.is_empty());
+        assert!(!parsed.cli_tools_initialized);
+        let sanitized = parsed.sanitized();
+        assert!(sanitized.cli_tools_initialized);
     }
 }
