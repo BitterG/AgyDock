@@ -22,6 +22,22 @@ function nowTimeStr() {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+function normPathKey(p) {
+  return String(p || '')
+    .trim()
+    .replace(/\//g, '\\')
+    .replace(/\\+$/, '')
+    .toLowerCase();
+}
+
+function slugifyToolId(raw) {
+  const slug = String(raw || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || 'tool';
+}
+
 export function initProxyModule() {
   const els = {
     launchBtn: document.getElementById('proxyLaunchBtn'),
@@ -62,11 +78,37 @@ export function initProxyModule() {
     chkAutoRefresh: document.getElementById('proxyChkAutoRefresh'),
     inputAgyPath: document.getElementById('proxyInputAgyPath'),
     btnBrowseAgy: document.getElementById('proxyBtnBrowseAgy'),
+    inputCliPath: document.getElementById('proxyInputCliPath'),
+    btnBrowseCli: document.getElementById('proxyBtnBrowseCli'),
+    btnDetectCli: document.getElementById('proxyBtnDetectCli'),
     inputClashPath: document.getElementById('proxyInputClashPath'),
     btnBrowseClash: document.getElementById('proxyBtnBrowseClash'),
     inputWorkspace: document.getElementById('proxyInputWorkspace'),
     btnBrowseWorkspace: document.getElementById('proxyBtnBrowseWorkspace'),
     btnClearWorkspace: document.getElementById('proxyBtnClearWorkspace'),
+
+    cliStatusTag: document.getElementById('proxyCliStatusTag'),
+    shimStatusTag: document.getElementById('proxyShimStatusTag'),
+    btnCliTerminal: document.getElementById('proxyBtnCliTerminal'),
+    btnTestCli: document.getElementById('proxyBtnTestCli'),
+    btnToggleShim: document.getElementById('proxyBtnToggleShim'),
+    btnSyncShim: document.getElementById('proxyBtnSyncShim'),
+    btnCopySnippets: document.getElementById('proxyBtnCopySnippets'),
+    btnStopCli: document.getElementById('proxyBtnStopCli'),
+    btnAddTool: document.getElementById('proxyBtnAddTool'),
+    toolForm: document.getElementById('proxyToolForm'),
+    toolName: document.getElementById('proxyToolName'),
+    toolIsChromium: document.getElementById('proxyToolIsChromium'),
+    toolMonitor: document.getElementById('proxyToolMonitor'),
+    toolExePath: document.getElementById('proxyToolExePath'),
+    toolBrowseExe: document.getElementById('proxyToolBrowseExe'),
+    toolArgs: document.getElementById('proxyToolArgs'),
+    toolWorkDir: document.getElementById('proxyToolWorkDir'),
+    toolBrowseDir: document.getElementById('proxyToolBrowseDir'),
+    toolSaveBtn: document.getElementById('proxyToolSaveBtn'),
+    toolCancelBtn: document.getElementById('proxyToolCancelBtn'),
+    cliToolsBody: document.getElementById('proxyCliToolsBody'),
+    cliMetaText: document.getElementById('proxyCliMetaText'),
 
     subViewControl: document.getElementById('proxySubViewControl'),
     tabConnBtn: document.getElementById('proxyTabConnBtn'),
@@ -100,6 +142,9 @@ export function initProxyModule() {
     refreshing: false,
     autoRefresh: true,
     settings: null,
+    cliTools: [],
+    cliToolsInitialized: false,
+    editingToolId: null,
     snapshot: null,
     displayedConnections: [],
     logs: [],
@@ -136,12 +181,31 @@ export function initProxyModule() {
   function setBusy(busy) {
     state.busy = busy;
     const disabled = busy || state.auditing;
-    els.launchBtn.disabled = disabled;
-    els.refreshBtn.disabled = disabled;
-    els.btnStartClash.disabled = disabled;
-    els.btnFlushDns.disabled = disabled;
-    els.btnDryRun.disabled = disabled;
-    els.btnStopAgy.disabled = disabled;
+    [
+      els.launchBtn,
+      els.refreshBtn,
+      els.btnStartClash,
+      els.btnFlushDns,
+      els.btnDryRun,
+      els.btnStopAgy,
+      els.btnCliTerminal,
+      els.btnTestCli,
+      els.btnToggleShim,
+      els.btnSyncShim,
+      els.btnStopCli,
+      els.btnDetectCli,
+    ]
+      .filter(Boolean)
+      .forEach((btn) => {
+        btn.disabled = disabled;
+      });
+    if (els.cliToolsBody) {
+      els.cliToolsBody
+        .querySelectorAll('.cli-tool-launch-btn, .cli-tool-stop-btn')
+        .forEach((btn) => {
+          btn.disabled = disabled;
+        });
+    }
   }
 
   function setSubView(view) {
@@ -156,6 +220,70 @@ export function initProxyModule() {
     els.logTools.classList.toggle('hidden', isConn);
   }
 
+  function renderCliTools() {
+    if (!els.cliToolsBody) return;
+    const counts = state.snapshot?.toolRunningCounts || {};
+    const disabledAttr = state.busy || state.auditing ? 'disabled' : '';
+
+    if (!state.cliTools.length) {
+      els.cliToolsBody.innerHTML = `
+        <tr class="empty-row">
+          <td colspan="4">
+            <span>当前尚未配置外部工具（如 T3 Code）</span>
+            <button type="button" class="btn" id="proxyBtnAutoDetectTools" style="margin-left: 10px;">自动探测 T3 Code</button>
+          </td>
+        </tr>
+      `;
+      return;
+    }
+
+    els.cliToolsBody.innerHTML = state.cliTools
+      .map((tool) => {
+        const running = counts[tool.id] || 0;
+        const modeLabel = tool.isChromium ? 'Chromium + Env' : '仅环境变量';
+        const statusHtml = !tool.monitor
+          ? '<span class="tag">未监控</span>'
+          : running > 0
+            ? `<span class="tag tag-ok">运行中 x${running}</span>`
+            : '<span class="tag">未运行</span>';
+        const launchLabel = running > 0 ? '隔离重启' : '隔离启动';
+        const launchClass = running > 0 ? 'btn' : 'btn btn-primary';
+        const argsTag = tool.args
+          ? `<span class="tag mono">${escapeHtml(tool.args)}</span>`
+          : '';
+        const dirTag = tool.workingDir
+          ? `<span class="tag mono" title="${escapeHtml(tool.workingDir)}">自定义目录</span>`
+          : '';
+        const idAttr = escapeHtml(tool.id);
+
+        return `
+          <tr>
+            <td>
+              <div class="cli-tool-meta">
+                <div class="cli-tool-title-row">
+                  <span class="cli-tool-name">${escapeHtml(tool.name)}</span>
+                  ${argsTag}
+                  ${dirTag}
+                </div>
+                <div class="cli-tool-path mono">${escapeHtml(tool.exePath)}</div>
+              </div>
+            </td>
+            <td><span class="tag mono">${modeLabel}</span></td>
+            <td>${statusHtml}</td>
+            <td>
+              <div class="cli-tool-actions">
+                <button type="button" class="${launchClass} cli-tool-launch-btn" data-tool-id="${idAttr}" ${disabledAttr}>${launchLabel}</button>
+                <button type="button" class="btn btn-danger-subtle cli-tool-stop-btn" data-tool-id="${idAttr}" ${disabledAttr}>结束</button>
+                <button type="button" class="btn cli-tool-edit-btn" data-tool-id="${idAttr}">编辑</button>
+                <button type="button" class="btn cli-tool-del-btn" data-tool-id="${idAttr}">删除</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      })
+      .join('');
+  }
+
   function renderConnections() {
     const showIpc = Boolean(els.chkShowIpc.checked);
     const filtered = showIpc
@@ -166,7 +294,7 @@ export function initProxyModule() {
 
     if (!filtered.length) {
       els.connTableBody.innerHTML =
-        '<tr class="empty-row"><td colspan="6">当前没有可显示的外部连接（在 Antigravity 发一条消息即可看到实时套接字）</td></tr>';
+        '<tr class="empty-row"><td colspan="6">当前没有可显示的外部连接（在 Antigravity、agy CLI 或 T3 Code 发一条消息即可看到实时套接字）</td></tr>';
       return;
     }
 
@@ -202,18 +330,23 @@ export function initProxyModule() {
     const proxied = overrideCounts ? overrideCounts.proxied : snap.proxiedCount;
     const tun = overrideCounts ? overrideCounts.tun : snap.tunCount;
     const direct = overrideCounts ? overrideCounts.direct : snap.directCount;
-    const totalProcs = (snap.antigravityProcCount || 0) + (snap.languageServerProcCount || 0);
+    const agyProcs = (snap.antigravityProcCount || 0) + (snap.languageServerProcCount || 0);
+    const cliProcs = snap.cliProcCount || 0;
+    const toolProcs = snap.toolProcCount || 0;
+    const totalProcs = agyProcs + cliProcs + toolProcs;
 
     const bypassEnabled = Boolean(
       state.settings?.bypassChinaAndLan || state.settings?.customBypassDomains?.trim()
     );
-    const lsDirect = state.displayedConnections.some(
-      (c) =>
-        c.category === 'publicDirect' &&
-        String(c.processName || '')
-          .toLowerCase()
-          .startsWith('language_server')
-    );
+    const coreDirect = state.displayedConnections.some((c) => {
+      if (c.category !== 'publicDirect') return false;
+      const procLower = String(c.processName || '').toLowerCase();
+      return (
+        procLower.startsWith('language_server') ||
+        procLower === 'agy' ||
+        procLower === 'antigravity-cli'
+      );
+    });
 
     // Status headline & dot
     els.statusDot.className = 'status-dot';
@@ -222,8 +355,8 @@ export function initProxyModule() {
       els.headline.textContent = '代理端口未监听';
     } else if (totalProcs === 0) {
       els.statusDot.classList.add('muted');
-      els.headline.textContent = 'Antigravity 未运行';
-    } else if (lsDirect || (!bypassEnabled && direct > 0)) {
+      els.headline.textContent = 'Antigravity 与 CLI 未运行';
+    } else if (coreDirect || (!bypassEnabled && direct > 0)) {
       els.statusDot.classList.add('err');
       els.headline.textContent = '检测到公网直连';
     } else if (tun > 0) {
@@ -241,7 +374,7 @@ export function initProxyModule() {
     const bypassTag = bypassEnabled ? ' · 国内直连' : '';
     els.headlineSub.textContent = `${snap.proxyHost}:${snap.resolvedPort}${modeSuffix}${bypassTag} · ${snap.portSource}`;
 
-    els.launchBtn.textContent = totalProcs > 0 ? '重启 Antigravity' : '启动 Antigravity';
+    els.launchBtn.textContent = agyProcs > 0 ? '重启 Antigravity' : '启动 Antigravity';
 
     // System env cell
     const sysText = snap.systemProxyEnabled ? '系统代理 开' : '系统代理 关';
@@ -252,7 +385,7 @@ export function initProxyModule() {
         ? `网卡: ${snap.tunAdapterText || 'TUN Active'}`
         : `系统代理: ${snap.systemProxyServer || '已开启'}`;
     } else {
-      els.envSub.textContent = '不改系统代理，仅隔离 Antigravity';
+      els.envSub.textContent = '不改系统代理，仅隔离 Antigravity 与 CLI';
     }
 
     els.warnBanner.classList.toggle('hidden', !(snap.systemProxyEnabled || snap.tunEnabled));
@@ -263,7 +396,7 @@ export function initProxyModule() {
 
     // Process cell
     els.procValue.textContent = `${totalProcs} 进程`;
-    els.procSub.textContent = `App x${snap.antigravityProcCount} · LS x${snap.languageServerProcCount} · Clash ${snap.isClashRunning ? '运行中' : '未运行'}`;
+    els.procSub.textContent = `App x${snap.antigravityProcCount} · LS x${snap.languageServerProcCount} · CLI x${cliProcs} · 工具 x${toolProcs} · Clash ${snap.isClashRunning ? '运行中' : '未运行'}`;
 
     // Connections count cell
     els.connValue.innerHTML = `
@@ -271,6 +404,48 @@ export function initProxyModule() {
     `;
     els.connSub.textContent = '走代理 / TUN / 公网直连';
 
+    // CLI & Shim status strip
+    const shim = snap.cliShim || {};
+    if (els.cliStatusTag) {
+      if (cliProcs > 0) {
+        els.cliStatusTag.textContent = `agy 运行中 x${cliProcs}`;
+        els.cliStatusTag.className = 'tag mono tag-ok';
+      } else if (shim.cliDetected) {
+        els.cliStatusTag.textContent = 'CLI 已就绪';
+        els.cliStatusTag.className = 'tag mono';
+      } else {
+        els.cliStatusTag.textContent = '未检测到 CLI';
+        els.cliStatusTag.className = 'tag mono tag-warn';
+      }
+    }
+    if (els.shimStatusTag) {
+      if (shim.enabled && shim.outOfSync) {
+        els.shimStatusTag.textContent = 'Shim 待同步';
+        els.shimStatusTag.className = 'tag mono tag-warn';
+      } else if (shim.enabled) {
+        els.shimStatusTag.textContent = 'Shim 已启用';
+        els.shimStatusTag.className = 'tag mono tag-ok';
+      } else {
+        els.shimStatusTag.textContent = 'Shim 未启用';
+        els.shimStatusTag.className = 'tag mono';
+      }
+    }
+    if (els.btnToggleShim) {
+      els.btnToggleShim.textContent = shim.enabled ? '停用 CLI Shim' : '启用 CLI Shim';
+    }
+    if (els.btnSyncShim) {
+      els.btnSyncShim.classList.toggle('hidden', !(shim.enabled && shim.outOfSync));
+    }
+    if (els.btnStopCli) {
+      els.btnStopCli.classList.toggle('hidden', cliProcs === 0);
+    }
+    if (els.cliMetaText) {
+      const cliText = shim.cliPath || '未检测到（请在「设置」配置或点击「重新探测」）';
+      const shimState = shim.enabled ? '已加入用户 PATH' : '未加入 PATH';
+      els.cliMetaText.textContent = `CLI: ${cliText} · Shim 目录: ${shim.shimDir || '—'} (${shimState})`;
+    }
+
+    renderCliTools();
     renderConnections();
 
     const ws = state.settings?.workspacePath?.trim();
@@ -290,8 +465,12 @@ export function initProxyModule() {
     els.chkDisableQuic.checked = Boolean(s.disableQuic);
     els.chkShowIpc.checked = Boolean(s.showLoopbackIpc);
     els.inputAgyPath.value = s.antigravityPath || '';
+    if (els.inputCliPath) els.inputCliPath.value = s.cliPath || '';
     els.inputClashPath.value = s.clashVergePath || '';
     els.inputWorkspace.value = s.workspacePath || '';
+    state.cliTools = Array.isArray(s.cliTools) ? s.cliTools.map((t) => ({ ...t })) : [];
+    state.cliToolsInitialized = Boolean(s.cliToolsInitialized);
+    renderCliTools();
   }
 
   function collectSettingsFromForm() {
@@ -308,6 +487,9 @@ export function initProxyModule() {
       showLoopbackIpc: Boolean(els.chkShowIpc.checked),
       bypassChinaAndLan: els.chkBypassChina ? Boolean(els.chkBypassChina.checked) : true,
       customBypassDomains: els.inputCustomBypass ? els.inputCustomBypass.value.trim() : '',
+      cliPath: els.inputCliPath ? els.inputCliPath.value.trim() : '',
+      cliTools: state.cliTools,
+      cliToolsInitialized: state.cliToolsInitialized,
     };
   }
 
@@ -319,6 +501,12 @@ export function initProxyModule() {
         const next = collectSettingsFromForm();
         const saved = await tauriInvoke('proxy_save_settings', { settings: next });
         state.settings = saved;
+        state.cliTools = Array.isArray(saved.cliTools) ? saved.cliTools.map((t) => ({ ...t })) : [];
+        state.cliToolsInitialized = Boolean(saved.cliToolsInitialized);
+        if (els.inputCliPath && document.activeElement !== els.inputCliPath) {
+          els.inputCliPath.value = saved.cliPath || '';
+        }
+        renderCliTools();
       } catch (err) {
         appendLog(`[!] 保存设置失败: ${err}`);
       }
@@ -391,6 +579,177 @@ export function initProxyModule() {
     }
   }
 
+  async function runLaunchTool(toolId, forceRestart) {
+    if (!tauriInvoke) return;
+    const tool = state.cliTools.find((t) => t.id === toolId);
+    if (!tool) return;
+    hideConfirm();
+    await persistSettings(true);
+    setBusy(true);
+    try {
+      const res = await tauriInvoke('proxy_launch_cli_tool', { toolId, forceRestart });
+      for (const l of res.logs || []) appendLog(l);
+      if (res.needConfirm) {
+        showConfirm(
+          `检测到 ${tool.name} 当前有 ${res.processCount} 个相关进程正在运行（含子进程 agy）。必须重启才能让隔离代理生效，确认关闭并重启？`,
+          () => runLaunchTool(toolId, true)
+        );
+        return;
+      }
+      if (!res.ok && res.error) {
+        appendLog(`[X] ${res.error}`);
+        setSubView('logs');
+      } else if (res.ok) {
+        setTimeout(() => refreshSnapshot(), 900);
+      }
+    } catch (err) {
+      appendLog(`[X] 启动 ${tool.name} 异常: ${err}`);
+      setSubView('logs');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runStopTool(toolId) {
+    if (!tauriInvoke || state.busy) return;
+    const tool = state.cliTools.find((t) => t.id === toolId);
+    if (!tool) return;
+    const running = state.snapshot?.toolRunningCounts?.[toolId] || 0;
+    const doStop = async () => {
+      setBusy(true);
+      try {
+        const res = await tauriInvoke('proxy_stop_cli_tool', { toolId });
+        for (const l of res.logs || []) appendLog(l);
+        await refreshSnapshot();
+      } catch (err) {
+        appendLog(`[X] 结束 ${tool.name} 失败: ${err}`);
+      } finally {
+        setBusy(false);
+      }
+    };
+    if (running > 0) {
+      showConfirm(
+        `确定要结束 ${tool.name} 及其 ${running} 个相关进程（含子进程 agy）吗？`,
+        doStop
+      );
+    } else {
+      await doStop();
+    }
+  }
+
+  function openToolForm(tool = null) {
+    if (!els.toolForm) return;
+    state.editingToolId = tool ? tool.id : null;
+    els.toolName.value = tool ? tool.name : '';
+    els.toolExePath.value = tool ? tool.exePath : '';
+    els.toolArgs.value = tool ? tool.args || '' : '';
+    els.toolWorkDir.value = tool ? tool.workingDir || '' : '';
+    els.toolIsChromium.checked = tool ? Boolean(tool.isChromium) : true;
+    els.toolMonitor.checked = tool ? tool.monitor !== false : true;
+    els.toolSaveBtn.textContent = tool ? '保存修改' : '添加工具';
+    els.toolForm.classList.remove('hidden');
+    els.toolName.focus();
+  }
+
+  function closeToolForm() {
+    if (!els.toolForm) return;
+    state.editingToolId = null;
+    els.toolForm.classList.add('hidden');
+  }
+
+  async function saveToolForm() {
+    const exePath = els.toolExePath.value.trim();
+    if (!exePath) {
+      appendLog('[!] 请先填写或选择工具的可执行文件路径。');
+      els.toolExePath.focus();
+      return;
+    }
+    const rawName = els.toolName.value.trim();
+    const stem = exePath.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '') || 'tool';
+    const name = rawName || stem;
+    const args = els.toolArgs.value.trim();
+    const workingDir = els.toolWorkDir.value.trim();
+    const isChromium = Boolean(els.toolIsChromium.checked);
+    const monitor = Boolean(els.toolMonitor.checked);
+
+    if (state.editingToolId) {
+      state.cliTools = state.cliTools.map((t) =>
+        t.id === state.editingToolId
+          ? { ...t, name, exePath, args, workingDir, isChromium, monitor }
+          : t
+      );
+      appendLog(`[OK] 已更新工具配置: ${name}`);
+    } else {
+      const baseId = slugifyToolId(name);
+      const used = new Set(state.cliTools.map((t) => t.id));
+      let nextId = baseId;
+      let idx = 2;
+      while (used.has(nextId)) {
+        nextId = `${baseId}-${idx++}`;
+      }
+      state.cliTools = [
+        ...state.cliTools,
+        { id: nextId, name, exePath, args, workingDir, isChromium, monitor },
+      ];
+      appendLog(`[OK] 已添加外部工具: ${name}`);
+    }
+
+    state.cliToolsInitialized = true;
+    closeToolForm();
+    renderCliTools();
+    await persistSettings(true);
+    await refreshSnapshot();
+  }
+
+  async function detectCliAndTools(overrideCliPath = true) {
+    if (!tauriInvoke || state.busy) return;
+    setBusy(true);
+    try {
+      const res = await tauriInvoke('proxy_detect_cli_and_tools');
+      let changed = false;
+
+      if (res?.cliPath && (overrideCliPath || !els.inputCliPath.value.trim())) {
+        if (normPathKey(els.inputCliPath.value) !== normPathKey(res.cliPath)) {
+          els.inputCliPath.value = res.cliPath;
+          changed = true;
+        }
+        appendLog(`[OK] 检测到 Antigravity CLI: ${res.cliPath}`);
+        if ((res.cliCandidates || []).length > 1) {
+          appendLog(`[i] 共发现 ${res.cliCandidates.length} 个 agy.exe 候选路径。`);
+        }
+      } else if (!res?.cliPath) {
+        appendLog('[!] 未自动发现 agy.exe，请点击「浏览」手动选择。');
+      }
+
+      const existingKeys = new Set(state.cliTools.map((t) => normPathKey(t.exePath)));
+      const existingIds = new Set(state.cliTools.map((t) => t.id));
+      const addedNames = [];
+      for (const tool of res?.detectedTools || []) {
+        const key = normPathKey(tool.exePath);
+        if (!key || existingKeys.has(key) || existingIds.has(tool.id)) continue;
+        state.cliTools = [...state.cliTools, tool];
+        existingKeys.add(key);
+        existingIds.add(tool.id);
+        addedNames.push(tool.name);
+        changed = true;
+      }
+
+      if (addedNames.length) {
+        appendLog(`[OK] 已自动添加外部工具: ${addedNames.join(', ')}`);
+      }
+      state.cliToolsInitialized = true;
+      if (changed) {
+        renderCliTools();
+        await persistSettings(true);
+      }
+      await refreshSnapshot();
+    } catch (err) {
+      appendLog(`[X] 自动探测失败: ${err}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runAudit() {
     if (!tauriInvoke) return;
     if (state.auditing) {
@@ -406,7 +765,7 @@ export function initProxyModule() {
     els.auditBar.classList.remove('hidden');
     els.auditFill.style.width = '0%';
     els.auditLabel.textContent = '验收中 0/20s';
-    appendLog('[..] 开始 20 秒累计验收检查（请在 Antigravity 中发一条消息）...');
+    appendLog('[..] 开始 20 秒累计验收检查（请在 Antigravity、agy CLI 或接入工具中触发请求）...');
 
     try {
       const res = await tauriInvoke('proxy_run_audit', { seconds: 20 });
@@ -482,6 +841,7 @@ export function initProxyModule() {
     els.inputHost,
     els.inputPort,
     els.inputAgyPath,
+    els.inputCliPath,
     els.inputClashPath,
     els.inputWorkspace,
     els.inputCustomBypass,
@@ -498,14 +858,16 @@ export function initProxyModule() {
     });
   }
 
-  async function browseField(kind, inputEl) {
+  async function browseField(kind, inputEl, saveImmediately = true) {
     if (!tauriInvoke) return;
     try {
       const res = await tauriInvoke('proxy_browse_path', { kind, current: inputEl.value });
       if (res?.selected) {
         inputEl.value = res.path;
-        await persistSettings(true);
-        refreshSnapshot();
+        if (saveImmediately) {
+          await persistSettings(true);
+          refreshSnapshot();
+        }
       }
     } catch (err) {
       appendLog(`[!] 选择路径失败: ${err}`);
@@ -513,6 +875,12 @@ export function initProxyModule() {
   }
 
   els.btnBrowseAgy.addEventListener('click', () => browseField('antigravity', els.inputAgyPath));
+  if (els.btnBrowseCli) {
+    els.btnBrowseCli.addEventListener('click', () => browseField('cli', els.inputCliPath));
+  }
+  if (els.btnDetectCli) {
+    els.btnDetectCli.addEventListener('click', () => detectCliAndTools(true));
+  }
   els.btnBrowseClash.addEventListener('click', () => browseField('clash', els.inputClashPath));
   els.btnBrowseWorkspace.addEventListener('click', () =>
     browseField('workspace', els.inputWorkspace)
@@ -522,6 +890,191 @@ export function initProxyModule() {
     await persistSettings(true);
     refreshSnapshot();
   });
+
+  // CLI & Tools event bindings
+  if (els.btnCliTerminal) {
+    els.btnCliTerminal.addEventListener('click', async () => {
+      if (!tauriInvoke || state.busy) return;
+      await persistSettings(true);
+      setBusy(true);
+      try {
+        const res = await tauriInvoke('proxy_launch_cli_terminal');
+        for (const l of res.logs || []) appendLog(l);
+        if (!res.ok && res.error) {
+          appendLog(`[X] ${res.error}`);
+          setSubView('logs');
+        }
+      } catch (err) {
+        appendLog(`[X] 打开隔离终端失败: ${err}`);
+        setSubView('logs');
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  if (els.btnTestCli) {
+    els.btnTestCli.addEventListener('click', async () => {
+      if (!tauriInvoke || state.busy) return;
+      await persistSettings(true);
+      setBusy(true);
+      try {
+        const res = await tauriInvoke('proxy_test_cli');
+        for (const l of res.logs || []) appendLog(l);
+        setSubView('logs');
+      } catch (err) {
+        appendLog(`[X] CLI 测试异常: ${err}`);
+        setSubView('logs');
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  async function toggleOrSyncShim(forceEnable) {
+    if (!tauriInvoke || state.busy) return;
+    await persistSettings(true);
+    setBusy(true);
+    try {
+      const enabled = Boolean(state.snapshot?.cliShim?.enabled);
+      const cmd = forceEnable || !enabled ? 'proxy_enable_cli_shim' : 'proxy_disable_cli_shim';
+      const res = await tauriInvoke(cmd);
+      for (const l of res.logs || []) appendLog(l);
+      if (!res.ok && res.error) {
+        appendLog(`[X] ${res.error}`);
+        setSubView('logs');
+      }
+      await refreshSnapshot();
+    } catch (err) {
+      appendLog(`[X] 操作 CLI Shim 失败: ${err}`);
+      setSubView('logs');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (els.btnToggleShim) {
+    els.btnToggleShim.addEventListener('click', () => toggleOrSyncShim(false));
+  }
+  if (els.btnSyncShim) {
+    els.btnSyncShim.addEventListener('click', () => toggleOrSyncShim(true));
+  }
+
+  if (els.btnCopySnippets) {
+    els.btnCopySnippets.addEventListener('click', async () => {
+      if (!tauriInvoke) return;
+      await persistSettings(true);
+      try {
+        const snippets = await tauriInvoke('proxy_cli_snippets');
+        appendLog(`[终端代理变量 (${snippets.proxyUrl})]`);
+        appendLog(`  PowerShell : ${snippets.powershell}`);
+        appendLog(`  CMD        : ${snippets.cmd}`);
+        appendLog(`  Bash / Zsh : ${snippets.bash}`);
+        try {
+          await navigator.clipboard.writeText(snippets.powershell);
+          const orig = els.btnCopySnippets.textContent;
+          els.btnCopySnippets.textContent = '已复制 PS';
+          setTimeout(() => {
+            els.btnCopySnippets.textContent = orig;
+          }, 1400);
+          appendLog('[OK] 已将 PowerShell 隔离代理命令复制到剪贴板（CMD/Bash 命令见上方日志）。');
+        } catch {
+          appendLog('[!] 无法写入剪贴板，请从日志中手动复制。');
+          setSubView('logs');
+        }
+      } catch (err) {
+        appendLog(`[X] 生成终端命令失败: ${err}`);
+      }
+    });
+  }
+
+  if (els.btnStopCli) {
+    els.btnStopCli.addEventListener('click', async () => {
+      if (!tauriInvoke || state.busy) return;
+      const cliProcs = state.snapshot?.cliProcCount || 0;
+      if (cliProcs === 0) {
+        appendLog('[i] 当前没有正在运行的 agy CLI 进程。');
+        await refreshSnapshot();
+        return;
+      }
+      showConfirm(`确定要结束当前正在运行的 ${cliProcs} 个 agy CLI 进程吗？`, async () => {
+        setBusy(true);
+        try {
+          const res = await tauriInvoke('proxy_stop_cli_processes');
+          for (const l of res.logs || []) appendLog(l);
+          await refreshSnapshot();
+        } catch (err) {
+          appendLog(`[X] 结束 CLI 进程失败: ${err}`);
+        } finally {
+          setBusy(false);
+        }
+      });
+    });
+  }
+
+  if (els.btnAddTool) {
+    els.btnAddTool.addEventListener('click', () => {
+      if (els.toolForm && !els.toolForm.classList.contains('hidden') && !state.editingToolId) {
+        closeToolForm();
+      } else {
+        openToolForm(null);
+      }
+    });
+  }
+  if (els.toolBrowseExe) {
+    els.toolBrowseExe.addEventListener('click', () =>
+      browseField('tool', els.toolExePath, false)
+    );
+  }
+  if (els.toolBrowseDir) {
+    els.toolBrowseDir.addEventListener('click', () =>
+      browseField('tool_dir', els.toolWorkDir, false)
+    );
+  }
+  if (els.toolSaveBtn) {
+    els.toolSaveBtn.addEventListener('click', () => saveToolForm());
+  }
+  if (els.toolCancelBtn) {
+    els.toolCancelBtn.addEventListener('click', () => closeToolForm());
+  }
+
+  if (els.cliToolsBody) {
+    els.cliToolsBody.addEventListener('click', async (evt) => {
+      const detectBtn = evt.target.closest('#proxyBtnAutoDetectTools');
+      if (detectBtn) {
+        detectCliAndTools(false);
+        return;
+      }
+      const launchBtn = evt.target.closest('.cli-tool-launch-btn');
+      if (launchBtn) {
+        runLaunchTool(launchBtn.dataset.toolId, false);
+        return;
+      }
+      const stopBtn = evt.target.closest('.cli-tool-stop-btn');
+      if (stopBtn) {
+        runStopTool(stopBtn.dataset.toolId);
+        return;
+      }
+      const editBtn = evt.target.closest('.cli-tool-edit-btn');
+      if (editBtn) {
+        const tool = state.cliTools.find((t) => t.id === editBtn.dataset.toolId);
+        if (tool) openToolForm(tool);
+        return;
+      }
+      const delBtn = evt.target.closest('.cli-tool-del-btn');
+      if (delBtn) {
+        const id = delBtn.dataset.toolId;
+        const tool = state.cliTools.find((t) => t.id === id);
+        state.cliTools = state.cliTools.filter((t) => t.id !== id);
+        state.cliToolsInitialized = true;
+        if (state.editingToolId === id) closeToolForm();
+        renderCliTools();
+        await persistSettings(true);
+        if (tool) appendLog(`[i] 已移除工具配置: ${tool.name}`);
+        await refreshSnapshot();
+      }
+    });
+  }
 
   els.btnStartClash.addEventListener('click', async () => {
     if (!tauriInvoke || state.busy) return;

@@ -1201,3 +1201,60 @@ body {
 .audit-head .btn {
   flex-shrink: 0;
 }
+
+/* CLI & External Tools Isolation Panel */
+.cli-header-actions {
+  flex-wrap: wrap;
+}
+
+.cli-tool-form {
+  background: var(--surface-subtle);
+  border-bottom: 1px solid var(--border);
+}
+
+.cli-tool-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cli-tool-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cli-tool-name {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.cli-tool-path {
+  font-size: 11px;
+  color: var(--ink-muted);
+  word-break: break-all;
+}
+
+.cli-tool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.cli-tool-actions .btn {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.cli-shim-bar {
+  padding: 8px 16px;
+  border-top: 1px solid var(--divider);
+  background: var(--surface-subtle);
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
