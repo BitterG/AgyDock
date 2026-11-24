@@ -234,4 +234,71 @@ test('recovers legacy missing model fields from USER_SETTINGS_CHANGE and parent 
   assert.equal(resolvedChild.parentTitle, 'run task');
   assert.equal(resolvedChild.title, 'Code Auditor');
   assert.equal(resolvedChild.subagentType, 'research');
+  assert.equal(parent.events[0].genDurationMs, 1000);
+  assert.equal(parent.events[0].tokensPerSec, 300);
+});
+
+test('computes multi-tool output speed (tok/s) and ignores user wait gaps', () => {
+  const txt = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-24T10:00:00Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 2000,
+      output_tokens: 1000,
+      tool_calls: [{ name: 'write_file' }, { name: 'write_file' }],
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'GENERIC',
+      created_at: '2026-11-24T10:00:04Z',
+      content: 'ok',
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      created_at: '2026-11-24T10:00:10Z',
+      content: 'ok',
+    }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-24T10:00:11Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 2500,
+      output_tokens: 200,
+    }),
+    JSON.stringify({
+      step_index: 4,
+      type: 'USER_INPUT',
+      created_at: '2026-11-24T10:15:00Z',
+      content: 'next',
+    }),
+  ].join('\n');
+
+  const parsed = parseTranscriptText(txt, 'speed-session');
+  assert.equal(parsed.events.length, 2);
+  assert.equal(parsed.events[0].genDurationMs, 10000);
+  assert.equal(parsed.events[0].tokensPerSec, 100);
+  assert.equal(parsed.events[1].genDurationMs, null);
+  assert.equal(parsed.events[1].tokensPerSec, null);
+
+  const agg = aggregateUsage(
+    {
+      brainDir: 'test',
+      scannedAt: Date.now(),
+      error: null,
+      totalDirs: 1,
+      parsedSessions: 1,
+      skippedDirs: 0,
+      sessions: [parsed],
+    },
+    { range: 'all' }
+  );
+  assert.equal(agg.summary.avgOutputTokensPerSec, 100);
+  assert.equal(agg.summary.peakOutputTokensPerSec, 100);
+  assert.equal(agg.summary.speedSampleCount, 1);
+  assert.equal(agg.models[0].avgOutputTokensPerSec, 100);
+  assert.equal(agg.sessions[0].avgOutputTokensPerSec, 100);
 });

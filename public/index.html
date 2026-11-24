@@ -88,7 +88,7 @@
     <div class="notice hidden" id="noticeBar"></div>
 
     <!-- Row 1: Unified KPI Strip -->
-    <section class="kpi-strip" aria-label="核心指标">
+    <section class="kpi-strip kpi-strip-5" aria-label="核心指标">
       <div class="kpi-cell">
         <div class="kpi-label">总 Token 消耗</div>
         <div class="kpi-value mono" id="kpiTotal">—</div>
@@ -98,6 +98,11 @@
         <div class="kpi-label">输入 / 输出 (Input / Output)</div>
         <div class="kpi-value mono" id="kpiIo">—</div>
         <div class="kpi-sub mono" id="kpiIoSub">—</div>
+      </div>
+      <div class="kpi-cell">
+        <div class="kpi-label">输出速度 (Output Speed)</div>
+        <div class="kpi-value mono" id="kpiSpeed">—</div>
+        <div class="kpi-sub mono" id="kpiSpeedSub">—</div>
       </div>
       <div class="kpi-cell">
         <div class="kpi-label">缓存命中率 (Cache Hit)</div>
@@ -197,6 +202,7 @@
               <tr>
                 <th>模型</th>
                 <th class="num">调用</th>
+                <th class="num">速度</th>
                 <th class="num">净消耗</th>
                 <th class="num">命中率</th>
                 <th class="num">总计</th>
@@ -231,6 +237,7 @@
             <option value="recent">按最近活跃</option>
             <option value="total">按总 Token</option>
             <option value="output">按 Output</option>
+            <option value="speed">按输出速度</option>
             <option value="calls">按调用次数</option>
           </select>
         </div>
@@ -240,15 +247,16 @@
         <table class="data-table ledger-table" id="sessionTable">
           <thead>
             <tr>
-              <th style="width: 108px;">最近时间</th>
+              <th style="width: 104px;">最近时间</th>
               <th>会话摘要</th>
-              <th style="width: 164px;">主模型</th>
-              <th class="num" style="width: 56px;">调用</th>
-              <th class="num" style="width: 74px;">Input</th>
-              <th class="num" style="width: 72px;">Output</th>
-              <th class="num" style="width: 78px;">Cache</th>
-              <th class="num" style="width: 64px;">命中率</th>
-              <th class="num" style="width: 78px;">总计</th>
+              <th style="width: 152px;">主模型</th>
+              <th class="num" style="width: 50px;">调用</th>
+              <th class="num" style="width: 72px;">速度</th>
+              <th class="num" style="width: 68px;">Input</th>
+              <th class="num" style="width: 68px;">Output</th>
+              <th class="num" style="width: 72px;">Cache</th>
+              <th class="num" style="width: 60px;">命中率</th>
+              <th class="num" style="width: 72px;">总计</th>
             </tr>
           </thead>
           <tbody id="sessionTableBody"></tbody>

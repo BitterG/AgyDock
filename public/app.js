@@ -2,6 +2,7 @@ import {
   formatTokensM,
   formatExact,
   formatPct,
+  formatSpeed,
   renderCacheRateChart,
   renderTokenTrendChart,
   renderUsageHeatmap,
@@ -91,6 +92,8 @@ const els = {
   kpiTotalSub: document.getElementById('kpiTotalSub'),
   kpiIo: document.getElementById('kpiIo'),
   kpiIoSub: document.getElementById('kpiIoSub'),
+  kpiSpeed: document.getElementById('kpiSpeed'),
+  kpiSpeedSub: document.getElementById('kpiSpeedSub'),
   kpiCache: document.getElementById('kpiCache'),
   kpiCacheSub: document.getElementById('kpiCacheSub'),
   kpiSessions: document.getElementById('kpiSessions'),
@@ -293,6 +296,22 @@ function renderHeaderAndKpis(data) {
   const outputShare = summary.netTokens > 0 ? summary.outputTokens / summary.netTokens : 0;
   els.kpiIoSub.textContent = `输出占净消耗 ${formatPct(outputShare)} · 均值 ${formatTokensM(summary.avgTokensPerCall)}/次`;
 
+  // KPI 2.5: Output Speed (tok/s)
+  if (els.kpiSpeed) {
+    const avgTps = summary.avgOutputTokensPerSec || 0;
+    const peakTps = summary.peakOutputTokensPerSec || 0;
+    const samples = summary.speedSampleCount || 0;
+    if (avgTps > 0 && samples > 0) {
+      els.kpiSpeed.innerHTML = `${avgTps.toFixed(1)}<span class="kpi-unit">tok/s</span>`;
+      els.kpiSpeed.title = `加权平均输出速度 ${avgTps.toFixed(1)} tok/s（含思考与首字延迟，基于 ${samples} 次带工具调用的步骤采样）`;
+      els.kpiSpeedSub.textContent = `峰值 ${peakTps.toFixed(1)} tok/s · ${samples} 次采样`;
+    } else {
+      els.kpiSpeed.textContent = '—';
+      els.kpiSpeed.title = '当前范围内暂无可计算输出速度的采样步骤';
+      els.kpiSpeedSub.textContent = '基于工具步骤耗时估算';
+    }
+  }
+
   // KPI 3: Cache Hit Rate
   els.kpiCache.textContent = summary.callCount > 0 ? formatPct(summary.cacheHitRate) : '—';
   els.kpiCache.title = `Cache Read: ${formatExact(summary.cacheReadTokens)} / Total Input: ${formatExact(summary.inputTokens + summary.cacheReadTokens)}`;
@@ -341,7 +360,7 @@ function syncModelFilterOptions(availableModels) {
 
 function renderModelsTable(models) {
   if (!models.length) {
-    els.modelTableBody.innerHTML = '<tr class="empty-row"><td colspan="5">暂无模型调用数据</td></tr>';
+    els.modelTableBody.innerHTML = '<tr class="empty-row"><td colspan="6">暂无模型调用数据</td></tr>';
     return;
   }
 
@@ -349,6 +368,12 @@ function renderModelsTable(models) {
     .map((m) => {
       const selected = state.model === m.model ? ' selected' : '';
       const pct = Math.max(2, Math.round(m.share * 100));
+      const speedTitle =
+        m.speedSampleCount > 0
+          ? `均值 ${(m.avgOutputTokensPerSec || 0).toFixed(1)} tok/s · 峰值 ${(
+              m.peakOutputTokensPerSec || 0
+            ).toFixed(1)} tok/s（${m.speedSampleCount} 次采样）`
+          : '暂无速度采样';
       return `
         <tr class="clickable${selected}" data-model="${escapeHtml(m.model)}">
           <td>
@@ -358,6 +383,7 @@ function renderModelsTable(models) {
             </div>
           </td>
           <td class="num">${m.callCount}</td>
+          <td class="num" title="${escapeHtml(speedTitle)}">${formatSpeed(m.avgOutputTokensPerSec)}</td>
           <td class="num" title="${formatExact(m.netTokens)}">${formatTokensM(m.netTokens)}</td>
           <td class="num">${formatPct(m.cacheHitRate)}</td>
           <td class="num" title="${formatExact(m.totalTokens)}">${formatTokensM(m.totalTokens)}</td>
@@ -412,6 +438,13 @@ function buildDisplaySessions(sessions) {
     parentGroup.cacheWriteTokens += s.cacheWriteTokens || 0;
     parentGroup.netTokens += s.netTokens;
     parentGroup.totalTokens += s.totalTokens;
+    parentGroup.speedOutputTokens = (parentGroup.speedOutputTokens || 0) + (s.speedOutputTokens || 0);
+    parentGroup.speedDurationMs = (parentGroup.speedDurationMs || 0) + (s.speedDurationMs || 0);
+    parentGroup.speedSampleCount = (parentGroup.speedSampleCount || 0) + (s.speedSampleCount || 0);
+    parentGroup.avgOutputTokensPerSec =
+      parentGroup.speedDurationMs > 0
+        ? Math.round(((parentGroup.speedOutputTokens * 1000) / parentGroup.speedDurationMs) * 10) / 10
+        : 0;
     if (s.startedAt && (!parentGroup.startedAt || s.startedAt < parentGroup.startedAt)) {
       parentGroup.startedAt = s.startedAt;
     }
@@ -458,6 +491,12 @@ function getFilteredSortedSessions(sessions) {
     sorted.sort((a, b) => b.totalTokens - a.totalTokens);
   } else if (state.sort === 'output') {
     sorted.sort((a, b) => b.outputTokens - a.outputTokens);
+  } else if (state.sort === 'speed') {
+    sorted.sort(
+      (a, b) =>
+        (b.avgOutputTokensPerSec || 0) - (a.avgOutputTokensPerSec || 0) ||
+        b.outputTokens - a.outputTokens
+    );
   } else if (state.sort === 'calls') {
     sorted.sort((a, b) => b.callCount - a.callCount);
   } else {
@@ -486,6 +525,8 @@ function buildStepTableHtml(events) {
           <td class="num" title="${formatExact(ev.inputTokens)}">${formatTokensM(ev.inputTokens)}</td>
           <td class="num" title="${formatExact(ev.outputTokens)}">${formatTokensM(ev.outputTokens)}</td>
           <td class="num" title="${formatExact(ev.cacheReadTokens)}">${formatTokensM(ev.cacheReadTokens)}</td>
+          <td class="num">${ev.genDurationMs ? formatDuration(ev.genDurationMs) : '—'}</td>
+          <td class="num">${formatSpeed(ev.tokensPerSec)}</td>
           <td class="num">${ev.toolCount}</td>
           <td class="mono">${escapeHtml(ev.status)}</td>
         </tr>
@@ -499,13 +540,15 @@ function buildStepTableHtml(events) {
         <thead>
           <tr>
             <th class="num" style="width: 56px;">Step</th>
-            <th style="width: 88px;">时间</th>
+            <th style="width: 84px;">时间</th>
             <th>模型</th>
             <th class="num">Input</th>
             <th class="num">Output</th>
             <th class="num">Cache Read</th>
-            <th class="num" style="width: 60px;">Tools</th>
-            <th style="width: 72px;">状态</th>
+            <th class="num" style="width: 60px;">耗时</th>
+            <th class="num" style="width: 78px;">速度</th>
+            <th class="num" style="width: 52px;">Tools</th>
+            <th style="width: 68px;">状态</th>
           </tr>
         </thead>
         <tbody>${rowsHtml}</tbody>
@@ -631,7 +674,7 @@ function renderSessionsTable(sessions) {
 
   if (!list.length) {
     els.sessionTableBody.innerHTML =
-      '<tr class="empty-row"><td colspan="9">当前筛选条件下无会话记录</td></tr>';
+      '<tr class="empty-row"><td colspan="10">当前筛选条件下无会话记录</td></tr>';
     return;
   }
 
@@ -651,6 +694,11 @@ function renderSessionsTable(sessions) {
         ? `<span class="session-parent-ref" title="归属主会话: ${escapeHtml(s.parentTitle)}">归属: ${escapeHtml(s.parentTitle)}</span>`
         : '';
 
+    const speedTitle =
+      s.speedSampleCount > 0
+        ? `加权平均 ${(s.avgOutputTokensPerSec || 0).toFixed(1)} tok/s（${s.speedSampleCount} 次采样）`
+        : '暂无速度采样';
+
     tr.innerHTML = `
       <td class="mono" style="white-space:nowrap;">${formatDateTime(s.lastAt)}</td>
       <td class="session-title-cell">
@@ -666,6 +714,7 @@ function renderSessionsTable(sessions) {
       </td>
       <td class="mono session-model-cell" title="${escapeHtml(s.primaryModel)}">${escapeHtml(s.primaryModel)}</td>
       <td class="num">${s.callCount}</td>
+      <td class="num" title="${escapeHtml(speedTitle)}">${formatSpeed(s.avgOutputTokensPerSec)}</td>
       <td class="num" title="${formatExact(s.inputTokens)}">${formatTokensM(s.inputTokens)}</td>
       <td class="num" title="${formatExact(s.outputTokens)}">${formatTokensM(s.outputTokens)}</td>
       <td class="num" title="${formatExact(s.cacheReadTokens)}">${formatTokensM(s.cacheReadTokens)}</td>
@@ -683,7 +732,7 @@ function renderSessionsTable(sessions) {
       const detailTr = document.createElement('tr');
       detailTr.className = 'detail-row';
       const td = document.createElement('td');
-      td.colSpan = 9;
+      td.colSpan = 10;
       detailTr.appendChild(td);
       frag.appendChild(detailTr);
       renderSessionDetailInto(detailTr, s);

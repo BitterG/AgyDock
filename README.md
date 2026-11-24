@@ -64,7 +64,7 @@ node server.mjs --port 4000 --dir "C:\Users\<用户名>\.gemini\antigravity\brai
 
 ## 核心功能
 
-- **Token 总览（统一换算为 M）**：总消耗、Fresh Input / Output 拆分、缓存命中率（`cache_read / (input + cache_read)`）、主会话数与子代理数。
+- **Token 总览（统一换算为 M）**：总消耗、Fresh Input / Output 拆分、**输出速度（`tok/s`，含峰值与按模型/会话/单步速度）**、缓存命中率（`cache_read / (input + cache_read)`）、主会话数与子代理数。
 - **Token 消耗趋势**：按日 / 按小时 SVG 堆叠柱状图，点击图例可独立开关 `Output`、`Input`、`Cache Read` 图层。
 - **缓存命中率趋势**：分时段命中率柱状图与均值虚线参考线。
 - **模型分布**：自动回溯旧版日志与子代理继承模型，点击模型行可全局筛选。

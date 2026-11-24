@@ -43,6 +43,11 @@ export function formatPct(rate) {
   return `${(rate * 100).toFixed(1)}%`;
 }
 
+export function formatSpeed(tps) {
+  if (!Number.isFinite(tps) || tps <= 0) return '—';
+  return tps >= 100 ? `${tps.toFixed(0)} tok/s` : `${tps.toFixed(1)} tok/s`;
+}
+
 function niceMax(rawMax) {
   if (rawMax <= 0) return 100;
   const exp = Math.floor(Math.log10(rawMax));
@@ -246,6 +251,13 @@ export function renderTokenTrendChart({
       const drillHint = onSelectDay
         ? '<div class="tt-hint">点击柱条查看当日 24 小时明细</div>'
         : '';
+      const speedRow =
+        item.avgOutputTokensPerSec > 0
+          ? `<div class="tt-row">
+               <span class="tt-key">输出速度</span>
+               <span class="tt-val">${formatSpeed(item.avgOutputTokensPerSec)}</span>
+             </div>`
+          : '';
       tooltipEl.innerHTML = `
         <div class="tt-title">${item.label}</div>
         <div class="tt-row">
@@ -269,6 +281,7 @@ export function renderTokenTrendChart({
           <span class="tt-key">调用 / 命中率</span>
           <span class="tt-val">${item.callCount} 次 · ${formatPct(item.cacheHitRate)}</span>
         </div>
+        ${speedRow}
         ${drillHint}
       `;
       tooltipEl.classList.remove('hidden');

@@ -186,6 +186,8 @@ pub struct SessionEvent {
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub tool_count: u64,
+    pub gen_duration_ms: Option<i64>,
+    pub tokens_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +227,35 @@ struct PendingInvoke {
     subagent_type: Option<String>,
 }
 
+struct PendingSpeed {
+    event_idx: usize,
+    start_ts: i64,
+    output_tokens: u64,
+    remaining_tools: usize,
+    last_tool_ts: Option<i64>,
+}
+
+fn finalize_pending_speed(pending: Option<PendingSpeed>, events: &mut [SessionEvent]) {
+    let Some(p) = pending else {
+        return;
+    };
+    let Some(end_ts) = p.last_tool_ts else {
+        return;
+    };
+    let duration_ms = end_ts - p.start_ts;
+    if !(1_000..=600_000).contains(&duration_ms) || p.output_tokens == 0 {
+        return;
+    }
+    let tps = (p.output_tokens as f64) / (duration_ms as f64 / 1000.0);
+    if !(1.0..=1200.0).contains(&tps) {
+        return;
+    }
+    if let Some(ev) = events.get_mut(p.event_idx) {
+        ev.gen_duration_ms = Some(duration_ms);
+        ev.tokens_per_sec = Some((tps * 10.0).round() / 10.0);
+    }
+}
+
 pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
     let mut title = String::new();
     let mut has_user_input = false;
@@ -237,6 +268,7 @@ pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
     let mut current_setting_model: Option<String> = None;
     let mut last_explicit_model: Option<String> = None;
     let mut pending_invokes: VecDeque<PendingInvoke> = VecDeque::new();
+    let mut pending_speed: Option<PendingSpeed> = None;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -258,6 +290,21 @@ pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
         }
 
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(mut p) = pending_speed.take() {
+            if matches!(entry_type, "USER_INPUT" | "SYSTEM_MESSAGE" | "PLANNER_RESPONSE") {
+                finalize_pending_speed(Some(p), &mut events);
+            } else {
+                if let Some(tk) = ts_opt {
+                    p.last_tool_ts = Some(p.last_tool_ts.map_or(tk, |cur| cur.max(tk)));
+                }
+                p.remaining_tools = p.remaining_tools.saturating_sub(1);
+                if p.remaining_tools == 0 {
+                    finalize_pending_speed(Some(p), &mut events);
+                } else {
+                    pending_speed = Some(p);
+                }
+            }
+        }
         if entry_type == "USER_INPUT" {
             has_user_input = true;
         }
@@ -356,10 +403,15 @@ pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
         );
 
         let mut tool_count: u64 = 0;
+        let mut has_ask_question = false;
         if let Some(tool_calls) = entry.get("tool_calls").and_then(|v| v.as_array()) {
             tool_count = tool_calls.len() as u64;
             for tc in tool_calls {
-                if tc.get("name").and_then(|v| v.as_str()) == Some("invoke_subagent") {
+                let name = tc.get("name").and_then(|v| v.as_str());
+                if name == Some("ask_question") {
+                    has_ask_question = true;
+                }
+                if name == Some("invoke_subagent") {
                     let args = tc.get("args");
                     pending_invokes.push_back(PendingInvoke {
                         requested_model: unquote_arg(args.and_then(|a| a.get("Model"))),
@@ -414,8 +466,24 @@ pub fn parse_transcript_text(text: &str, session_id: &str) -> ParsedSession {
             cache_write_tokens,
             total_tokens,
             tool_count,
+            gen_duration_ms: None,
+            tokens_per_sec: None,
         });
+
+        if entry_type == "PLANNER_RESPONSE" && tool_count > 0 && output_tokens > 0 && !has_ask_question {
+            if let Some(start_ts) = ts_opt {
+                pending_speed = Some(PendingSpeed {
+                    event_idx: events.len() - 1,
+                    start_ts,
+                    output_tokens,
+                    remaining_tools: tool_count as usize,
+                    last_tool_ts: None,
+                });
+            }
+        }
     }
+
+    finalize_pending_speed(pending_speed, &mut events);
 
     let fallback_title = if !title.is_empty() {
         title
@@ -811,6 +879,9 @@ pub struct UsageSummary {
     pub tool_call_count: u64,
     pub avg_tokens_per_call: u64,
     pub avg_tokens_per_session: u64,
+    pub avg_output_tokens_per_sec: f64,
+    pub peak_output_tokens_per_sec: f64,
+    pub speed_sample_count: u64,
     pub last_activity_at: Option<i64>,
 }
 
@@ -829,6 +900,12 @@ pub struct SeriesBucket {
     pub net_tokens: u64,
     pub call_count: u64,
     pub cache_hit_rate: f64,
+    pub avg_output_tokens_per_sec: f64,
+    pub speed_sample_count: u64,
+    #[serde(skip_serializing)]
+    pub speed_output_tokens: u64,
+    #[serde(skip_serializing)]
+    pub speed_duration_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -844,6 +921,9 @@ pub struct ModelUsage {
     pub total_tokens: u64,
     pub net_tokens: u64,
     pub cache_hit_rate: f64,
+    pub avg_output_tokens_per_sec: f64,
+    pub peak_output_tokens_per_sec: f64,
+    pub speed_sample_count: u64,
     pub share: f64,
 }
 
@@ -872,6 +952,10 @@ pub struct SessionSummary {
     pub net_tokens: u64,
     pub total_tokens: u64,
     pub cache_hit_rate: f64,
+    pub avg_output_tokens_per_sec: f64,
+    pub speed_output_tokens: u64,
+    pub speed_duration_ms: i64,
+    pub speed_sample_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -913,6 +997,15 @@ fn calc_cache_hit_rate(input_tokens: u64, cache_read_tokens: u64) -> f64 {
         0.0
     } else {
         cache_read_tokens as f64 / denom as f64
+    }
+}
+
+fn calc_weighted_tps(output_tokens: u64, duration_ms: i64) -> f64 {
+    if duration_ms <= 0 || output_tokens == 0 {
+        0.0
+    } else {
+        let raw = (output_tokens as f64) * 1000.0 / (duration_ms as f64);
+        (raw * 10.0).round() / 10.0
     }
 }
 
@@ -1051,8 +1144,16 @@ pub fn aggregate_usage(
         tool_call_count: 0,
         avg_tokens_per_call: 0,
         avg_tokens_per_session: 0,
+        avg_output_tokens_per_sec: 0.0,
+        peak_output_tokens_per_sec: 0.0,
+        speed_sample_count: 0,
         last_activity_at: None,
     };
+
+    let mut summary_speed_out = 0u64;
+    let mut summary_speed_ms = 0i64;
+    let mut summary_peak_strict = 0.0f64;
+    let mut summary_peak_any = 0.0f64;
 
     struct ModelAgg {
         call_count: u64,
@@ -1063,6 +1164,11 @@ pub fn aggregate_usage(
         cache_write_tokens: u64,
         total_tokens: u64,
         net_tokens: u64,
+        speed_output_tokens: u64,
+        speed_duration_ms: i64,
+        speed_sample_count: u64,
+        peak_strict: f64,
+        peak_any: f64,
     }
 
     let mut bucket_map: HashMap<i64, SeriesBucket> = HashMap::new();
@@ -1078,6 +1184,9 @@ pub fn aggregate_usage(
         let mut sess_cache_write = 0u64;
         let mut sess_calls = 0u64;
         let mut sess_tools = 0u64;
+        let mut sess_speed_out = 0u64;
+        let mut sess_speed_ms = 0i64;
+        let mut sess_speed_samples = 0u64;
         let mut sess_first_ts: Option<i64> = None;
         let mut sess_last_ts: Option<i64> = None;
         let mut sess_model_tokens: HashMap<String, u64> = HashMap::new();
@@ -1155,6 +1264,10 @@ pub fn aggregate_usage(
                     net_tokens: 0,
                     call_count: 0,
                     cache_hit_rate: 0.0,
+                    avg_output_tokens_per_sec: 0.0,
+                    speed_sample_count: 0,
+                    speed_output_tokens: 0,
+                    speed_duration_ms: 0,
                 }
             });
             bucket.input_tokens += ev.input_tokens;
@@ -1174,6 +1287,11 @@ pub fn aggregate_usage(
                 cache_write_tokens: 0,
                 total_tokens: 0,
                 net_tokens: 0,
+                speed_output_tokens: 0,
+                speed_duration_ms: 0,
+                speed_sample_count: 0,
+                peak_strict: 0.0,
+                peak_any: 0.0,
             });
             m_agg.call_count += 1;
             m_agg.sessions.insert(session.id.clone());
@@ -1183,6 +1301,36 @@ pub fn aggregate_usage(
             m_agg.cache_write_tokens += ev.cache_write_tokens;
             m_agg.total_tokens += ev.total_tokens;
             m_agg.net_tokens += ev.input_tokens + ev.output_tokens;
+
+            if let (Some(dur_ms), Some(tps)) = (ev.gen_duration_ms, ev.tokens_per_sec) {
+                sess_speed_out += ev.output_tokens;
+                sess_speed_ms += dur_ms;
+                sess_speed_samples += 1;
+
+                summary_speed_out += ev.output_tokens;
+                summary_speed_ms += dur_ms;
+                summary.speed_sample_count += 1;
+                if tps > summary_peak_any {
+                    summary_peak_any = tps;
+                }
+                if dur_ms >= 3_000 && ev.output_tokens >= 100 && tps > summary_peak_strict {
+                    summary_peak_strict = tps;
+                }
+
+                bucket.speed_output_tokens += ev.output_tokens;
+                bucket.speed_duration_ms += dur_ms;
+                bucket.speed_sample_count += 1;
+
+                m_agg.speed_output_tokens += ev.output_tokens;
+                m_agg.speed_duration_ms += dur_ms;
+                m_agg.speed_sample_count += 1;
+                if tps > m_agg.peak_any {
+                    m_agg.peak_any = tps;
+                }
+                if dur_ms >= 3_000 && ev.output_tokens >= 100 && tps > m_agg.peak_strict {
+                    m_agg.peak_strict = tps;
+                }
+            }
         }
 
         if sess_calls > 0 {
@@ -1237,11 +1385,21 @@ pub fn aggregate_usage(
                 net_tokens: sess_net,
                 total_tokens: sess_total,
                 cache_hit_rate: calc_cache_hit_rate(sess_input, sess_cache_read),
+                avg_output_tokens_per_sec: calc_weighted_tps(sess_speed_out, sess_speed_ms),
+                speed_output_tokens: sess_speed_out,
+                speed_duration_ms: sess_speed_ms,
+                speed_sample_count: sess_speed_samples,
             });
         }
     }
 
     summary.cache_hit_rate = calc_cache_hit_rate(summary.input_tokens, summary.cache_read_tokens);
+    summary.avg_output_tokens_per_sec = calc_weighted_tps(summary_speed_out, summary_speed_ms);
+    summary.peak_output_tokens_per_sec = if summary_peak_strict > 0.0 {
+        summary_peak_strict
+    } else {
+        summary_peak_any
+    };
     summary.avg_tokens_per_call = if summary.call_count > 0 {
         summary.total_tokens / summary.call_count
     } else {
@@ -1295,6 +1453,8 @@ pub fn aggregate_usage(
         if let Some(mut existing) = bucket_map.remove(&ms) {
             existing.cache_hit_rate =
                 calc_cache_hit_rate(existing.input_tokens, existing.cache_read_tokens);
+            existing.avg_output_tokens_per_sec =
+                calc_weighted_tps(existing.speed_output_tokens, existing.speed_duration_ms);
             series.push(existing);
         } else {
             let (key, label, short_label) = format_bucket_labels(&timeline_start, granularity);
@@ -1311,6 +1471,10 @@ pub fn aggregate_usage(
                 net_tokens: 0,
                 call_count: 0,
                 cache_hit_rate: 0.0,
+                avg_output_tokens_per_sec: 0.0,
+                speed_sample_count: 0,
+                speed_output_tokens: 0,
+                speed_duration_ms: 0,
             });
         }
         timeline_start = if granularity == "hour" {
@@ -1334,6 +1498,13 @@ pub fn aggregate_usage(
             total_tokens: m.total_tokens,
             net_tokens: m.net_tokens,
             cache_hit_rate: calc_cache_hit_rate(m.input_tokens, m.cache_read_tokens),
+            avg_output_tokens_per_sec: calc_weighted_tps(m.speed_output_tokens, m.speed_duration_ms),
+            peak_output_tokens_per_sec: if m.peak_strict > 0.0 {
+                m.peak_strict
+            } else {
+                m.peak_any
+            },
+            speed_sample_count: m.speed_sample_count,
             share: if summary.total_tokens > 0 {
                 m.total_tokens as f64 / summary.total_tokens as f64
             } else {
@@ -1389,7 +1560,7 @@ fn iso_from_ms(ms: Option<i64>) -> String {
 pub fn build_sessions_csv(sessions: &[SessionSummary]) -> String {
     let mut lines = Vec::with_capacity(sessions.len() + 1);
     lines.push(
-        "session_id,kind,parent_id,title,started_at,last_at,primary_model,calls,tool_calls,input_tokens,output_tokens,cache_read_tokens,net_tokens,total_tokens,cache_hit_rate"
+        "session_id,kind,parent_id,title,started_at,last_at,primary_model,calls,tool_calls,input_tokens,output_tokens,cache_read_tokens,net_tokens,total_tokens,cache_hit_rate,avg_output_tps"
             .to_string(),
     );
     for s in sessions {
@@ -1416,6 +1587,11 @@ pub fn build_sessions_csv(sessions: &[SessionSummary]) -> String {
             s.net_tokens.to_string(),
             s.total_tokens.to_string(),
             format!("{:.2}%", s.cache_hit_rate * 100.0),
+            if s.avg_output_tokens_per_sec > 0.0 {
+                format!("{:.1}", s.avg_output_tokens_per_sec)
+            } else {
+                String::new()
+            },
         ];
         lines.push(
             row.iter()
@@ -1502,5 +1678,28 @@ mod tests {
         assert_eq!(agg.series.len(), 24);
         assert_eq!(agg.summary.call_count, 2);
         assert_eq!(agg.summary.total_tokens, 15700);
+        assert_eq!(agg.summary.speed_sample_count, 1);
+        assert!((agg.summary.avg_output_tokens_per_sec - 300.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn computes_multi_tool_output_speed_accurately() {
+        let txt = [
+            r#"{"step_index":0,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T10:00:00Z","model":"gemini-4-neon-high","input_tokens":2000,"output_tokens":1000,"tool_calls":[{"name":"write_file"},{"name":"write_file"}]}"#,
+            r#"{"step_index":1,"type":"GENERIC","created_at":"2026-11-24T10:00:04Z","content":"ok"}"#,
+            r#"{"step_index":2,"type":"GENERIC","created_at":"2026-11-24T10:00:10Z","content":"ok"}"#,
+            r#"{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"2026-11-24T10:00:11Z","model":"gemini-4-neon-high","input_tokens":2500,"output_tokens":200}"#,
+            r#"{"step_index":4,"type":"USER_INPUT","created_at":"2026-11-24T10:15:00Z","content":"next"}"#,
+        ]
+        .join("\n");
+
+        let parsed = parse_transcript_text(&txt, "speed-test");
+        assert_eq!(parsed.events.len(), 2);
+        // Step 0 spans 10s (to last parallel tool call) -> 1000 / 10 = 100.0 tok/s
+        assert_eq!(parsed.events[0].gen_duration_ms, Some(10_000));
+        assert_eq!(parsed.events[0].tokens_per_sec, Some(100.0));
+        // Step 3 has no tool_calls (followed by USER_INPUT 15m later) -> must NOT count user wait time
+        assert_eq!(parsed.events[1].gen_duration_ms, None);
+        assert_eq!(parsed.events[1].tokens_per_sec, None);
     }
 }
