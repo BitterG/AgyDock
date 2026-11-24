@@ -148,6 +148,15 @@ export function initAccountsModule() {
     sortSelect: document.getElementById('accountSort'),
     verifyBtn: document.getElementById('accountVerifyBtn'),
     openDirBtn: document.getElementById('accountOpenDirBtn'),
+    oauthBtn: document.getElementById('accountOAuthBtn'),
+    oauthPanel: document.getElementById('accountOAuthPanel'),
+    oauthStatusTag: document.getElementById('accountOAuthStatusTag'),
+    oauthCloseBtn: document.getElementById('accountOAuthCloseBtn'),
+    oauthClientId: document.getElementById('accountOAuthClientId'),
+    oauthClientSecret: document.getElementById('accountOAuthClientSecret'),
+    oauthSaveBtn: document.getElementById('accountOAuthSaveBtn'),
+    oauthClearBtn: document.getElementById('accountOAuthClearBtn'),
+    oauthPathNote: document.getElementById('accountOAuthPathNote'),
     tableBody: document.getElementById('accountsTableBody'),
 
     logCount: document.getElementById('accountLogCount'),
@@ -1399,6 +1408,130 @@ export function initAccountsModule() {
   els.verifyBtn.addEventListener('click', verifyAllBackups);
   els.openDirBtn.addEventListener('click', openStoreDir);
 
+  function applyOAuthStatus(status) {
+    if (!status) return;
+    const src = status.source || 'none';
+    const configured = Boolean(status.configured);
+
+    if (els.oauthBtn) {
+      els.oauthBtn.textContent = configured ? '离线续期 ✓' : '离线续期';
+    }
+    if (els.oauthStatusTag) {
+      let label = '未配置';
+      if (src === 'dpapi') label = '已配置 · DPAPI';
+      else if (src === 'env') label = '已配置 · 环境变量';
+      else if (src === 'file') label = '已配置 · JSON';
+      else if (configured) label = '已配置';
+      els.oauthStatusTag.textContent = label;
+      els.oauthStatusTag.className = configured ? 'tag mono tag-ok' : 'tag mono';
+    }
+    if (els.oauthClientId) {
+      els.oauthClientId.placeholder =
+        configured && status.clientIdPreview
+          ? `当前已配置 ${status.clientIdPreview}（留空保持不变，重新输入可覆盖）`
+          : '粘贴 OAuth Client ID（可选）';
+    }
+    if (els.oauthClientSecret) {
+      els.oauthClientSecret.placeholder = configured
+        ? '已保存（不回显；重新输入并保存可覆盖）'
+        : '粘贴 OAuth Client Secret（保存时经 DPAPI 加密，不回显原文）';
+    }
+    if (els.oauthPathNote) {
+      els.oauthPathNote.textContent =
+        src === 'env'
+          ? `优先使用环境变量 AGYDOCK_OAUTH_CLIENT_ID / AGYDOCK_OAUTH_CLIENT_SECRET（本机加密路径: ${
+              status.configPath || '—'
+            }）`
+          : status.configPath || '—';
+    }
+    if (els.oauthClearBtn) {
+      els.oauthClearBtn.classList.toggle('hidden', src !== 'dpapi' && src !== 'file');
+    }
+  }
+
+  async function loadOAuthStatus() {
+    if (!els.oauthPanel) return;
+    try {
+      const status = await tauriInvoke('quota_oauth_config_status');
+      applyOAuthStatus(status);
+    } catch {
+      // ignore initial status read failures
+    }
+  }
+
+  async function saveOAuthConfig() {
+    if (!els.oauthSaveBtn) return;
+    const clientId = String(els.oauthClientId?.value ?? '').trim();
+    const clientSecret = String(els.oauthClientSecret?.value ?? '').trim();
+    if (!clientId || !clientSecret) {
+      showNotice('请同时填写 Client ID 和 Client Secret。', 'warn');
+      if (!clientId) els.oauthClientId?.focus();
+      else els.oauthClientSecret?.focus();
+      return;
+    }
+
+    els.oauthSaveBtn.disabled = true;
+    if (els.oauthClearBtn) els.oauthClearBtn.disabled = true;
+    const prevText = els.oauthSaveBtn.textContent;
+    els.oauthSaveBtn.textContent = '保存中...';
+    try {
+      const status = await tauriInvoke('quota_oauth_config_save', { clientId, clientSecret });
+      if (els.oauthClientId) els.oauthClientId.value = '';
+      if (els.oauthClientSecret) els.oauthClientSecret.value = '';
+      applyOAuthStatus(status);
+      appendLog(
+        `[OK] 已使用 Windows DPAPI 加密保存本地 OAuth 刷新凭据 (${status?.clientIdPreview || '已配置'})。`
+      );
+      showNotice('已加密保存离线续期配置；现在可随时查询离线账号额度。', 'ok');
+    } catch (err) {
+      appendLog(`[X] 保存离线续期配置失败: ${err?.message || err}`);
+      showNotice(`保存配置失败: ${err?.message || err}`, 'error');
+    } finally {
+      els.oauthSaveBtn.disabled = false;
+      els.oauthSaveBtn.textContent = prevText;
+      if (els.oauthClearBtn) els.oauthClearBtn.disabled = false;
+    }
+  }
+
+  async function clearOAuthConfig() {
+    if (!els.oauthClearBtn) return;
+    els.oauthClearBtn.disabled = true;
+    if (els.oauthSaveBtn) els.oauthSaveBtn.disabled = true;
+    try {
+      const status = await tauriInvoke('quota_oauth_config_clear');
+      if (els.oauthClientId) els.oauthClientId.value = '';
+      if (els.oauthClientSecret) els.oauthClientSecret.value = '';
+      applyOAuthStatus(status);
+      appendLog('[OK] 已清除本机 OAuth 刷新凭据文件。');
+      showNotice(
+        status?.source === 'env'
+          ? '已清除本地凭据文件（环境变量配置仍生效）。'
+          : '已清除离线续期配置。',
+        'ok'
+      );
+    } catch (err) {
+      appendLog(`[X] 清除离线续期配置失败: ${err?.message || err}`);
+      showNotice(`清除配置失败: ${err?.message || err}`, 'error');
+    } finally {
+      els.oauthClearBtn.disabled = false;
+      if (els.oauthSaveBtn) els.oauthSaveBtn.disabled = false;
+    }
+  }
+
+  els.oauthBtn?.addEventListener('click', () => {
+    if (!els.oauthPanel) return;
+    const willShow = els.oauthPanel.classList.contains('hidden');
+    els.oauthPanel.classList.toggle('hidden', !willShow);
+    if (willShow) {
+      loadOAuthStatus();
+    }
+  });
+  els.oauthCloseBtn?.addEventListener('click', () => {
+    els.oauthPanel?.classList.add('hidden');
+  });
+  els.oauthSaveBtn?.addEventListener('click', saveOAuthConfig);
+  els.oauthClearBtn?.addEventListener('click', clearOAuthConfig);
+
   els.confirmOkBtn.addEventListener('click', () => {
     const fn = state.pendingConfirm;
     hideConfirm();
@@ -1469,6 +1602,7 @@ export function initAccountsModule() {
         // ignore event registration failures
       }
     }
+    loadOAuthStatus();
     try {
       const cachedMap = await tauriInvoke('quota_get_cached').catch(() => ({}));
       for (const [k, v] of Object.entries(cachedMap || {})) {

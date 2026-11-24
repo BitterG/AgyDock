@@ -950,6 +950,16 @@ async fn quota_get_cached(
     .map_err(|e| format!("Quota cache load failed: {e}"))?
 }
 
+fn collect_live_token_blobs(include_cred_mgr: bool) -> Vec<Vec<u8>> {
+    let mut blobs = credential::read_local_token_file_blobs();
+    if include_cred_mgr {
+        if let Ok(Some(blob)) = credential::read_blob() {
+            blobs.push(blob);
+        }
+    }
+    blobs
+}
+
 #[tauri::command]
 async fn quota_fetch_current(
     state: State<'_, AppState>,
@@ -966,7 +976,16 @@ async fn quota_fetch_current(
     let force = force_refresh.unwrap_or(false);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let blob = match credential::read_blob()? {
+        let local_file_blobs = credential::read_local_token_file_blobs();
+        let cred_mgr_blob = credential::read_blob()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let blob = match cred_mgr_blob
+            .or_else(|| credential::pick_freshest_any_blob(&local_file_blobs, now_ms))
+        {
             Some(b) => b,
             None => {
                 return Ok(AccountQuotaSnapshot {
@@ -995,6 +1014,7 @@ async fn quota_fetch_current(
 
         let snap = quota::fetch_quota_for_blob(
             &blob,
+            &local_file_blobs,
             account_id,
             &settings,
             &token_cache,
@@ -1044,6 +1064,8 @@ async fn quota_fetch_account(
             (entry, blob)
         };
 
+        let live_blobs = collect_live_token_blobs(true);
+
         let cached_map = {
             let _guard = cache_lock
                 .lock()
@@ -1053,6 +1075,7 @@ async fn quota_fetch_account(
 
         let mut snap = quota::fetch_quota_for_blob(
             &blob,
+            &live_blobs,
             Some(entry.id.clone()),
             &settings,
             &token_cache,
@@ -1131,8 +1154,9 @@ async fn quota_fetch_all(state: State<'_, AppState>) -> Result<Vec<AccountQuotaS
             }
         }
 
+        let live_blobs = collect_live_token_blobs(true);
         let mut results =
-            quota::fetch_all_accounts_quota(jobs, &settings, &token_cache, &cached_map);
+            quota::fetch_all_accounts_quota(jobs, &live_blobs, &settings, &token_cache, &cached_map);
         results.extend(pre_errors);
 
         {
@@ -1146,6 +1170,32 @@ async fn quota_fetch_all(state: State<'_, AppState>) -> Result<Vec<AccountQuotaS
     })
     .await
     .map_err(|e| format!("Quota fetch all failed: {e}"))?
+}
+
+#[tauri::command]
+async fn quota_oauth_config_status() -> Result<quota::OAuthClientStatus, String> {
+    tauri::async_runtime::spawn_blocking(quota::get_oauth_client_status)
+        .await
+        .map_err(|e| format!("Load OAuth config status failed: {e}"))
+}
+
+#[tauri::command]
+async fn quota_oauth_config_save(
+    client_id: String,
+    client_secret: String,
+) -> Result<quota::OAuthClientStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        quota::save_oauth_client_config(&client_id, &client_secret)
+    })
+    .await
+    .map_err(|e| format!("Save OAuth config failed: {e}"))?
+}
+
+#[tauri::command]
+async fn quota_oauth_config_clear() -> Result<quota::OAuthClientStatus, String> {
+    tauri::async_runtime::spawn_blocking(quota::clear_oauth_client_config)
+        .await
+        .map_err(|e| format!("Clear OAuth config failed: {e}"))?
 }
 
 // ------------------------- Isolated Proxy Commands -------------------------
@@ -1874,6 +1924,9 @@ pub fn run() {
             quota_fetch_current,
             quota_fetch_account,
             quota_fetch_all,
+            quota_oauth_config_status,
+            quota_oauth_config_save,
+            quota_oauth_config_clear,
             proxy_get_settings,
             proxy_save_settings,
             proxy_get_snapshot,

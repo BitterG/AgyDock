@@ -213,10 +213,10 @@ impl TokenCache {
         Self::default()
     }
 
-    fn get_valid(&self, key: &str, now: i64) -> Option<String> {
+    fn get_valid_with_expiry(&self, key: &str, now: i64) -> Option<(String, i64)> {
         let entry = self.entries.get(key)?;
         if entry.expires_at_ms > now + TOKEN_REFRESH_SKEW_MS && !entry.access_token.is_empty() {
-            Some(entry.access_token.clone())
+            Some((entry.access_token.clone(), entry.expires_at_ms))
         } else {
             None
         }
@@ -1182,6 +1182,38 @@ fn compute_summary_metrics(
     (min_frac, earliest_future.or(earliest_any))
 }
 
+const OAUTH_CONFIG_BIN_NAME: &str = "oauth-client.bin";
+const OAUTH_CONFIG_JSON_NAME: &str = "oauth-client.json";
+
+fn default_config_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("antigravity-usage-dashboard"))
+}
+
+/// 本地 OAuth 刷新凭据配置状态（绝不向前端回传密钥原文）。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthClientStatus {
+    pub configured: bool,
+    pub source: String,
+    pub client_id_preview: Option<String>,
+    pub config_path: String,
+}
+
+pub fn mask_client_id(id: &str) -> String {
+    let trimmed = id.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() > 18 {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[chars.len() - 6..].iter().collect();
+        format!("{head}...{tail}")
+    } else if chars.len() > 6 {
+        let head: String = chars[..4].iter().collect();
+        format!("{head}...")
+    } else {
+        "***".to_string()
+    }
+}
+
 pub fn parse_oauth_client_config_json(raw: &str) -> Option<(String, String)> {
     let val: Value = serde_json::from_str(raw).ok()?;
     let id = non_empty_str(val.get("clientId")).or_else(|| non_empty_str(val.get("client_id")))?;
@@ -1190,23 +1222,143 @@ pub fn parse_oauth_client_config_json(raw: &str) -> Option<(String, String)> {
     Some((id, secret))
 }
 
-fn load_oauth_client_config() -> Option<(String, String)> {
-    if let (Ok(id), Ok(secret)) = (
-        std::env::var("AGYDOCK_OAUTH_CLIENT_ID"),
-        std::env::var("AGYDOCK_OAUTH_CLIENT_SECRET"),
-    ) {
-        let id = id.trim().to_string();
-        let secret = secret.trim().to_string();
-        if !id.is_empty() && !secret.is_empty() {
-            return Some((id, secret));
+fn load_oauth_client_config_from_env() -> Option<(String, String)> {
+    let id = std::env::var("AGYDOCK_OAUTH_CLIENT_ID").ok()?;
+    let secret = std::env::var("AGYDOCK_OAUTH_CLIENT_SECRET").ok()?;
+    let id = id.trim().to_string();
+    let secret = secret.trim().to_string();
+    if !id.is_empty() && !secret.is_empty() {
+        Some((id, secret))
+    } else {
+        None
+    }
+}
+
+fn load_oauth_client_config_from_dir(base_dir: &Path) -> Option<(String, String, &'static str)> {
+    let bin_path = base_dir.join(OAUTH_CONFIG_BIN_NAME);
+    if let Ok(encrypted) = fs::read(&bin_path) {
+        if !encrypted.is_empty() {
+            if let Ok(plain) = credential::unprotect(&encrypted) {
+                if let Ok(text) = String::from_utf8(plain) {
+                    if let Some((id, secret)) = parse_oauth_client_config_json(&text) {
+                        return Some((id, secret, "dpapi"));
+                    }
+                }
+            }
         }
     }
 
-    let path = dirs::config_dir()?
-        .join("antigravity-usage-dashboard")
-        .join("oauth-client.json");
-    let raw = fs::read_to_string(path).ok()?;
-    parse_oauth_client_config_json(&raw)
+    let json_path = base_dir.join(OAUTH_CONFIG_JSON_NAME);
+    if let Ok(raw) = fs::read_to_string(&json_path) {
+        if let Some((id, secret)) = parse_oauth_client_config_json(&raw) {
+            return Some((id, secret, "file"));
+        }
+    }
+
+    None
+}
+
+fn load_oauth_client_config_in(base_dir: Option<&Path>) -> Option<(String, String, &'static str)> {
+    if let Some((id, secret)) = load_oauth_client_config_from_env() {
+        return Some((id, secret, "env"));
+    }
+    base_dir.and_then(load_oauth_client_config_from_dir)
+}
+
+fn load_oauth_client_config() -> Option<(String, String)> {
+    load_oauth_client_config_in(default_config_dir().as_deref()).map(|(id, secret, _)| (id, secret))
+}
+
+fn get_oauth_client_status_in(base_dir: Option<&Path>) -> OAuthClientStatus {
+    let dpapi_path = base_dir
+        .map(|d| d.join(OAUTH_CONFIG_BIN_NAME).to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    match load_oauth_client_config_in(base_dir) {
+        Some((id, _, source)) => {
+            let active_path = if source == "file" {
+                base_dir
+                    .map(|d| d.join(OAUTH_CONFIG_JSON_NAME).to_string_lossy().to_string())
+                    .unwrap_or_default()
+            } else {
+                dpapi_path
+            };
+            OAuthClientStatus {
+                configured: true,
+                source: source.to_string(),
+                client_id_preview: Some(mask_client_id(&id)),
+                config_path: active_path,
+            }
+        }
+        None => OAuthClientStatus {
+            configured: false,
+            source: "none".to_string(),
+            client_id_preview: None,
+            config_path: dpapi_path,
+        },
+    }
+}
+
+pub fn get_oauth_client_status() -> OAuthClientStatus {
+    get_oauth_client_status_in(default_config_dir().as_deref())
+}
+
+fn save_oauth_client_config_in(
+    base_dir: &Path,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<OAuthClientStatus, String> {
+    let id = client_id.trim();
+    let secret = client_secret.trim();
+    if id.is_empty() || secret.is_empty() {
+        return Err("Client ID 和 Client Secret 不能为空".to_string());
+    }
+
+    fs::create_dir_all(base_dir)
+        .map_err(|e| format!("无法创建配置目录 {}: {e}", base_dir.display()))?;
+    let payload = json!({
+        "clientId": id,
+        "clientSecret": secret,
+    });
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("序列化 OAuth 刷新凭据失败: {e}"))?;
+    let encrypted = credential::protect(&bytes)?;
+    write_atomic(&base_dir.join(OAUTH_CONFIG_BIN_NAME), &encrypted)?;
+
+    // 若存在历史明文 oauth-client.json，保存 DPAPI 密文后自动清理
+    let legacy_json = base_dir.join(OAUTH_CONFIG_JSON_NAME);
+    if legacy_json.exists() {
+        let _ = fs::remove_file(&legacy_json);
+    }
+
+    Ok(get_oauth_client_status_in(Some(base_dir)))
+}
+
+pub fn save_oauth_client_config(
+    client_id: &str,
+    client_secret: &str,
+) -> Result<OAuthClientStatus, String> {
+    let base_dir = default_config_dir().ok_or_else(|| "无法定位本地配置目录".to_string())?;
+    save_oauth_client_config_in(&base_dir, client_id, client_secret)
+}
+
+fn clear_oauth_client_config_in(base_dir: &Path) -> Result<OAuthClientStatus, String> {
+    for name in [OAUTH_CONFIG_BIN_NAME, OAUTH_CONFIG_JSON_NAME] {
+        let path = base_dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!("删除 {} 失败: {err}", path.display()));
+            }
+        }
+    }
+    Ok(get_oauth_client_status_in(Some(base_dir)))
+}
+
+pub fn clear_oauth_client_config() -> Result<OAuthClientStatus, String> {
+    let base_dir = default_config_dir().ok_or_else(|| "无法定位本地配置目录".to_string())?;
+    clear_oauth_client_config_in(&base_dir)
 }
 
 fn refresh_oauth_access_token(
@@ -1214,7 +1366,7 @@ fn refresh_oauth_access_token(
     proxy: Option<&str>,
 ) -> Result<(String, i64), String> {
     let (client_id, client_secret) = load_oauth_client_config().ok_or_else(|| {
-        "当前缓存的 access_token 已过期，请先在 Antigravity 中登录/切回一次自动续期（或在环境变量 AGYDOCK_OAUTH_CLIENT_ID / AGYDOCK_OAUTH_CLIENT_SECRET 或 oauth-client.json 中配置刷新凭据）".to_string()
+        "缓存的 access_token 已过期。请启动 Antigravity 或 T3 Code 自动续期，或在「账号管理 → 离线续期」中配置本地 OAuth 刷新凭据".to_string()
     })?;
 
     let body = format!(
@@ -1273,19 +1425,37 @@ fn resolve_access_token(
     let now = now_ms();
     let can_refresh = tokens.refresh_token.is_some() && load_oauth_client_config().is_some();
     if !(force_refresh && can_refresh) {
-        if let Ok(guard) = token_cache.lock() {
-            if let Some(tok) = guard.get_valid(cache_key, now) {
-                return Ok((tok, false));
-            }
-        }
-        if let Some(tok) = &tokens.access_token {
+        let cached = token_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get_valid_with_expiry(cache_key, now));
+        let disk_valid = tokens.access_token.as_ref().and_then(|tok| {
             let valid = tokens
                 .expires_at_ms
                 .map(|exp| exp > now + TOKEN_REFRESH_SKEW_MS)
                 .unwrap_or(true);
-            if valid {
-                return Ok((tok.clone(), false));
+            valid.then(|| (tok.clone(), tokens.expires_at_ms))
+        });
+
+        match (cached, disk_valid) {
+            (Some((_ctok, cexp)), Some((dtok, Some(dexp)))) if dexp > cexp => {
+                if let Ok(mut guard) = token_cache.lock() {
+                    guard.set(cache_key.to_string(), dtok.clone(), dexp);
+                }
+                return Ok((dtok, false));
             }
+            (Some((ctok, _)), _) => {
+                return Ok((ctok, false));
+            }
+            (None, Some((dtok, dexp_opt))) => {
+                if let Some(dexp) = dexp_opt {
+                    if let Ok(mut guard) = token_cache.lock() {
+                        guard.set(cache_key.to_string(), dtok.clone(), dexp);
+                    }
+                }
+                return Ok((dtok, false));
+            }
+            (None, None) => {}
         }
     }
 
@@ -1428,13 +1598,15 @@ pub fn error_snapshot_with_fallback(
 /// 使用给定的凭据 blob 查询账号套餐等级、剩余额度与刷新时间（不直接写磁盘，由调用方统一持久化）。
 pub fn fetch_quota_for_blob(
     blob: &[u8],
+    extra_blobs: &[Vec<u8>],
     account_id: Option<String>,
     settings: &ProxySettings,
     token_cache: &Arc<Mutex<TokenCache>>,
     cached_map: &HashMap<String, AccountQuotaSnapshot>,
     force_refresh: bool,
 ) -> AccountQuotaSnapshot {
-    let tokens = credential::extract_tokens(blob);
+    let primary_tokens = credential::extract_tokens(blob);
+    let tokens = credential::select_freshest_tokens(&primary_tokens, extra_blobs, None, now_ms());
     let email = tokens
         .email
         .clone()
@@ -1614,6 +1786,7 @@ pub fn fetch_quota_for_blob(
 /// 使用有界并发线程池批量查询多个账号的额度。
 pub fn fetch_all_accounts_quota(
     items: Vec<(Option<String>, Vec<u8>)>,
+    extra_blobs: &[Vec<u8>],
     settings: &ProxySettings,
     token_cache: &Arc<Mutex<TokenCache>>,
     cached_map: &HashMap<String, AccountQuotaSnapshot>,
@@ -1647,6 +1820,7 @@ pub fn fetch_all_accounts_quota(
                 };
                 let snap = fetch_quota_for_blob(
                     &blob,
+                    extra_blobs,
                     acc_id,
                     settings,
                     token_cache,
@@ -1927,5 +2101,83 @@ mod tests {
             None
         );
         assert_eq!(parse_oauth_client_config_json("not-json"), None);
+    }
+
+    #[test]
+    fn masks_client_id_safely() {
+        assert_eq!(
+            mask_client_id("123456789012-abcdefghijklmnopqrstuvwxyz.client.example"),
+            "12345678...xample"
+        );
+        assert_eq!(mask_client_id("1234567890"), "1234...");
+        assert_eq!(mask_client_id("short"), "***");
+        assert_eq!(mask_client_id("  1234567890123456789  "), "12345678...456789");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oauth_client_config_dpapi_roundtrip_and_clear() {
+        let dir = std::env::temp_dir().join(format!(
+            "agydock-oauth-dpapi-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let env_unset = load_oauth_client_config_from_env().is_none();
+        if env_unset {
+            let empty_status = get_oauth_client_status_in(Some(&dir));
+            assert!(!empty_status.configured);
+            assert_eq!(empty_status.source, "none");
+        }
+
+        // Prepare legacy plaintext file to verify it gets cleaned up after DPAPI save
+        let legacy_path = dir.join(OAUTH_CONFIG_JSON_NAME);
+        fs::write(&legacy_path, r#"{"clientId":"legacy","clientSecret":"legacy-sec"}"#).unwrap();
+
+        let client_id = "12345678-exampleclientid.example";
+        let client_secret = "super-secret-value-for-test-only";
+        let saved_status = save_oauth_client_config_in(&dir, client_id, client_secret).unwrap();
+
+        let bin_path = dir.join(OAUTH_CONFIG_BIN_NAME);
+        assert!(bin_path.is_file());
+        assert!(!legacy_path.exists());
+
+        let raw_bin = fs::read(&bin_path).unwrap();
+        let raw_lossy = String::from_utf8_lossy(&raw_bin);
+        assert!(!raw_lossy.contains(client_secret));
+        assert!(!raw_lossy.contains(client_id));
+
+        let (loaded_id, loaded_secret, loaded_src) =
+            load_oauth_client_config_from_dir(&dir).unwrap();
+        assert_eq!(loaded_id, client_id);
+        assert_eq!(loaded_secret, client_secret);
+        assert_eq!(loaded_src, "dpapi");
+
+        if env_unset {
+            assert!(saved_status.configured);
+            assert_eq!(saved_status.source, "dpapi");
+            assert_eq!(
+                saved_status.client_id_preview,
+                Some(mask_client_id(client_id))
+            );
+            assert!(!saved_status
+                .client_id_preview
+                .as_deref()
+                .unwrap_or_default()
+                .contains(client_secret));
+        }
+
+        let cleared_status = clear_oauth_client_config_in(&dir).unwrap();
+        assert!(!bin_path.exists());
+        assert!(load_oauth_client_config_from_dir(&dir).is_none());
+        if env_unset {
+            assert!(!cleared_status.configured);
+            assert_eq!(cleared_status.source, "none");
+            assert!(cleared_status.client_id_preview.is_none());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

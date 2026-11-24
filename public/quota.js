@@ -445,12 +445,19 @@ export function initUsageQuotaPanel() {
       const cur = await tauriInvoke('accounts_current').catch(() => null);
       state.present = Boolean(cur?.present);
       state.currentEmail = cur?.email || null;
-      if (!state.present) {
+      const snap = await tauriInvoke('quota_fetch_current', { forceRefresh });
+      const snapEmail = snap?.email && snap.email !== 'unknown' ? snap.email : null;
+      if (!cur?.present && !snapEmail) {
+        state.present = false;
+        state.currentEmail = null;
         state.snapshot = null;
         render();
         return;
       }
-      const snap = await tauriInvoke('quota_fetch_current', { forceRefresh });
+      if (!cur?.present && snapEmail) {
+        state.present = true;
+        state.currentEmail = snapEmail;
+      }
       state.snapshot = snap;
       render();
       emitQuotaUpdated(snap);
@@ -499,9 +506,7 @@ export function initUsageQuotaPanel() {
     } catch {
       // ignore initial cache read error
     }
-    if (state.present) {
-      await refresh(false);
-    }
+    await refresh(false);
   }
 
   els.refreshBtn.addEventListener('click', () => refresh(true));

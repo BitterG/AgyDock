@@ -646,6 +646,42 @@
       </div>
     </section>
 
+    <section class="panel hidden" id="accountOAuthPanel" aria-label="离线续期配置">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <h2 class="panel-title">离线续期配置 (可选)</h2>
+          <span class="tag mono" id="accountOAuthStatusTag">未配置</span>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="btn" id="accountOAuthCloseBtn">收起</button>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <div class="field-row">
+          <span class="field-label">说明</span>
+          <span class="panel-note">活跃中的 Antigravity / T3 Code / agy CLI 令牌会自动复用，无需配置。仅当未启动客户端的离线账号 access_token 已过期时才需要；凭据使用 Windows DPAPI 加密存于本机。</span>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="accountOAuthClientId">Client ID</label>
+          <div class="field-path">
+            <input type="text" id="accountOAuthClientId" class="text-input mono flex-1" placeholder="粘贴 OAuth Client ID（可选）" autocomplete="off" />
+          </div>
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="accountOAuthClientSecret">Client Secret</label>
+          <div class="field-path">
+            <input type="password" id="accountOAuthClientSecret" class="text-input mono flex-1" placeholder="粘贴 OAuth Client Secret（保存时经 DPAPI 加密，不回显原文）" autocomplete="off" />
+            <button type="button" class="btn btn-primary" id="accountOAuthSaveBtn">保存配置</button>
+            <button type="button" class="btn btn-danger-subtle hidden" id="accountOAuthClearBtn">清除配置</button>
+          </div>
+        </div>
+        <div class="field-row">
+          <span class="field-label">存储路径</span>
+          <span class="panel-note mono" id="accountOAuthPathNote">—</span>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-header">
         <div class="panel-title-group">
@@ -675,6 +711,7 @@
           </select>
           <button type="button" class="btn" id="accountVerifyBtn" title="使用 DPAPI 解密检验全部本地凭据备份是否完好">校验备份</button>
           <button type="button" class="btn" id="accountOpenDirBtn" title="在资源管理器中打开加密备份目录">打开目录</button>
+          <button type="button" class="btn" id="accountOAuthBtn" title="可选：配置本地 DPAPI 加密 OAuth 刷新凭据，用于多账号离线自动续期">离线续期</button>
         </div>
       </div>
       <div class="table-wrap">
