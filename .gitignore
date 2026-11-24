@@ -8,6 +8,8 @@ dist/
 accounts.json
 accounts.json.bak
 proxy-settings.json
+quota-cache.json
+oauth-client.json
 brain-dir.txt
 .env
 .env.*

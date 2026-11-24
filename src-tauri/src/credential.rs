@@ -163,6 +163,57 @@ pub fn parse_blob(blob: &[u8]) -> CredentialInfo {
     info
 }
 
+/// 内部使用的凭据令牌结构：绝不派生 Serialize，Debug 输出对令牌脱敏。
+#[derive(Clone, Default)]
+pub(crate) struct CredentialTokens {
+    pub email: Option<String>,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for CredentialTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialTokens")
+            .field("email", &self.email)
+            .field("access_token", &self.access_token.as_ref().map(|_| "[REDACTED]"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// 从凭据 blob 中提取 OAuth 令牌（仅供后端发起额度查询使用）。
+pub(crate) fn extract_tokens(blob: &[u8]) -> CredentialTokens {
+    let info = parse_blob(blob);
+    let mut out = CredentialTokens {
+        email: info.email,
+        access_token: None,
+        refresh_token: None,
+        expires_at_ms: info.expires_at_ms,
+    };
+    let text = String::from_utf8_lossy(blob);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return out;
+    };
+
+    let non_empty_str = |v: Option<&serde_json::Value>| -> Option<String> {
+        v.and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let token = value.get("token");
+    out.access_token = token
+        .and_then(|t| non_empty_str(t.get("access_token")))
+        .or_else(|| non_empty_str(value.get("access_token")));
+    out.refresh_token = token
+        .and_then(|t| non_empty_str(t.get("refresh_token")))
+        .or_else(|| non_empty_str(value.get("refresh_token")));
+
+    out
+}
+
 /// 读取当前登录凭据的原始 blob；未登录时返回 `Ok(None)`。
 pub fn read_blob() -> Result<Option<Vec<u8>>, String> {
     sys::read_blob(TARGET)
@@ -469,5 +520,29 @@ mod tests {
     #[cfg(windows)]
     fn delete_for_test(target: &str) -> Result<bool, String> {
         super::sys::delete(target)
+    }
+
+    #[test]
+    fn extract_tokens_parses_nested_and_top_level_and_redacts_debug() {
+        let nested = br#"{"token":{"access_token":"  ya29.secret-abc  ","refresh_token":"1//refresh-xyz","expiry":"2026-11-20T11:33:36+08:00"},"id_token_email":"user@example.com"}"#;
+        let t1 = extract_tokens(nested);
+        assert_eq!(t1.email.as_deref(), Some("user@example.com"));
+        assert_eq!(t1.access_token.as_deref(), Some("ya29.secret-abc"));
+        assert_eq!(t1.refresh_token.as_deref(), Some("1//refresh-xyz"));
+        assert_eq!(t1.expires_at_ms, Some(1795145616000));
+        let dbg = format!("{t1:?}");
+        assert!(!dbg.contains("ya29.secret-abc"));
+        assert!(!dbg.contains("1//refresh-xyz"));
+        assert!(dbg.contains("[REDACTED]"));
+
+        let top = br#"{"access_token":"top-access","refresh_token":"","email":"top@example.com"}"#;
+        let t2 = extract_tokens(top);
+        assert_eq!(t2.email.as_deref(), Some("top@example.com"));
+        assert_eq!(t2.access_token.as_deref(), Some("top-access"));
+        assert!(t2.refresh_token.is_none());
+
+        let garbage = extract_tokens(b"not-json");
+        assert!(garbage.access_token.is_none());
+        assert!(garbage.refresh_token.is_none());
     }
 }
