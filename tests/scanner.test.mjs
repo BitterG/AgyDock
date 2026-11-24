@@ -7,6 +7,7 @@ import {
   BrainScanner,
   aggregateUsage,
   buildSessionsCsv,
+  discoverDefaultBrainSources,
   parseTranscriptText,
   resolveInheritedModels,
 } from '../lib/scanner.mjs';
@@ -301,4 +302,144 @@ test('computes multi-tool output speed (tok/s) and ignores user wait gaps', () =
   assert.equal(agg.summary.speedSampleCount, 1);
   assert.equal(agg.models[0].avgOutputTokensPerSec, 100);
   assert.equal(agg.sessions[0].avgOutputTokensPerSec, 100);
+});
+
+test('strips T3 Code bootstrap wrappers and aggregates/filters multi-source brain dirs', async () => {
+  const t3Text = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-24T11:08:22Z',
+      content:
+        '<USER_REQUEST>\n<t3_code_instructions>\n## T3 Code interaction mode\n</t3_code_instructions>\n<runtime_info>runtime details</runtime_info>\n</USER_REQUEST>\n<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-24T11:08:22Z',
+      model: 'gemini-pro-orchestrator-neon',
+      input_tokens: 8000,
+      output_tokens: 60,
+      cache_read_tokens: 0,
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'USER_INPUT',
+      created_at: '2026-11-24T11:08:42Z',
+      content:
+        '<USER_REQUEST>\n写一个 hello world<runtime_info>In case you are asked</runtime_info>\n</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-24T11:08:45Z',
+      model: 'gemini-4-hydrogen-medium',
+      input_tokens: 3400,
+      output_tokens: 200,
+      cache_read_tokens: 1000,
+    }),
+  ].join('\n');
+
+  const parsedT3 = parseTranscriptText(t3Text, 't3-sess-1');
+  assert.equal(parsedT3.hasUserInput, true);
+  assert.equal(parsedT3.title, '写一个 hello world');
+
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-multi-src-'));
+  try {
+    const appDir = path.join(tmpHome, '.gemini', 'antigravity', 'brain');
+    const cliDir = path.join(tmpHome, '.gemini', 'antigravity-cli', 'brain');
+    const t3Dir = path.join(
+      tmpHome,
+      '.t3',
+      'userdata',
+      'providers',
+      'antigravity',
+      'inst-1',
+      'antigravity-acp',
+      'brain'
+    );
+    await fs.mkdir(path.join(appDir, 'shared-id', '.system_generated', 'logs'), { recursive: true });
+    await fs.mkdir(path.join(cliDir, 'cli-1', '.system_generated', 'logs'), { recursive: true });
+    await fs.mkdir(path.join(t3Dir, 'shared-id', '.system_generated', 'logs'), { recursive: true });
+
+    await fs.writeFile(
+      path.join(appDir, 'shared-id', '.system_generated', 'logs', 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: '2026-11-24T10:00:00Z',
+        content: '<USER_REQUEST>App 会话</USER_REQUEST>',
+      }) +
+        '\n' +
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-24T10:00:05Z',
+          model: 'gemini-4-neon-high',
+          input_tokens: 1000,
+          output_tokens: 100,
+        }),
+      'utf8'
+    );
+    await fs.writeFile(
+      path.join(cliDir, 'cli-1', '.system_generated', 'logs', 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 0,
+        type: 'USER_INPUT',
+        created_at: '2026-11-24T11:00:00Z',
+        content: '<USER_REQUEST>CLI 会话</USER_REQUEST>',
+      }) +
+        '\n' +
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-24T11:00:05Z',
+          model: 'gemini-4-neon-high',
+          input_tokens: 2000,
+          output_tokens: 200,
+        }),
+      'utf8'
+    );
+    await fs.writeFile(
+      path.join(t3Dir, 'shared-id', '.system_generated', 'logs', 'transcript.jsonl'),
+      t3Text,
+      'utf8'
+    );
+
+    const sources = await discoverDefaultBrainSources(tmpHome);
+    assert.equal(sources.length, 3);
+    assert.deepEqual(
+      sources.map((s) => s.id),
+      ['app', 'cli', 't3']
+    );
+
+    const handler = createRequestHandler({ sources });
+    const allRes = await invokeHandler(handler, '/api/usage?range=all');
+    assert.equal(allRes.status, 200);
+    const allData = JSON.parse(allRes.body);
+    assert.equal(allData.summary.sessionCount, 3);
+    assert.equal(allData.meta.sources.length, 3);
+    assert.equal(allData.meta.sourceFilter, 'all');
+
+    const t3Res = await invokeHandler(handler, '/api/usage?range=all&source=t3');
+    const t3Data = JSON.parse(t3Res.body);
+    assert.equal(t3Data.summary.sessionCount, 1);
+    assert.equal(t3Data.summary.totalTokens, 12660);
+    assert.equal(t3Data.meta.sourceFilter, 't3');
+    assert.equal(t3Data.sessions[0].source, 't3');
+    assert.equal(t3Data.sessions[0].sourceLabel, 'T3 Code');
+    assert.equal(t3Data.meta.sources.length, 3);
+
+    const detailT3 = await invokeHandler(handler, '/api/sessions/shared-id?source=t3');
+    assert.equal(detailT3.status, 200);
+    const detailT3Json = JSON.parse(detailT3.body);
+    assert.equal(detailT3Json.source, 't3');
+    assert.equal(detailT3Json.title, '写一个 hello world');
+
+    const csv = buildSessionsCsv(t3Data.sessions);
+    assert.ok(csv.startsWith('\uFEFFsession_id,source,'));
+    assert.ok(csv.includes('T3 Code'));
+  } finally {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  }
 });

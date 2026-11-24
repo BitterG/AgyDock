@@ -39,7 +39,7 @@
           <button type="button" class="step-btn" id="dayNextBtn" title="后一天">›</button>
         </div>
 
-        <button type="button" class="btn hidden" id="dirBtn" title="选择自定义 Antigravity 日志目录（按住 Shift 点击恢复默认）">
+        <button type="button" class="btn hidden" id="dirBtn" title="选择自定义日志目录（按住 Shift 点击恢复自动多来源聚合）">
           目录
         </button>
 
@@ -86,6 +86,18 @@
 
   <main class="container" id="usageView">
     <div class="notice hidden" id="noticeBar"></div>
+
+    <!-- Source Filter Strip -->
+    <section class="source-bar hidden" id="sourceBar" aria-label="日志来源筛选">
+      <div class="source-bar-left">
+        <span class="source-bar-label">数据来源</span>
+        <div class="segmented segmented-sm" id="sourceFilterControl" role="group" aria-label="来源筛选"></div>
+      </div>
+      <div class="source-bar-right">
+        <span class="panel-note mono" id="sourceBarNote"></span>
+        <button type="button" class="link-btn hidden" id="resetAutoSourceBtn">恢复自动多来源聚合</button>
+      </div>
+    </section>
 
     <!-- Row 1: Unified KPI Strip -->
     <section class="kpi-strip kpi-strip-5" aria-label="核心指标">
